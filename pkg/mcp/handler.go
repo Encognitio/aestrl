@@ -23,10 +23,15 @@ type Executor interface {
 	GetFile(sessionID, shareID, path string) (interface{}, error)
 }
 
+// TokenValidator validates dynamic tokens (e.g. OAuth 2.1 access tokens).
+type TokenValidator func(token string) bool
+
 // Handler handles Streamable HTTP and SSE MCP requests.
 type Handler struct {
-	expectedToken string
-	executor      Executor
+	expectedToken  string
+	tokenValidator TokenValidator
+	metadataURL    string
+	executor       Executor
 }
 
 // NewHandler creates a new MCP Handler.
@@ -35,6 +40,16 @@ func NewHandler(expectedToken string, executor Executor) *Handler {
 		expectedToken: expectedToken,
 		executor:      executor,
 	}
+}
+
+// SetTokenValidator sets a dynamic token validation function (e.g. for OAuth 2.1 tokens).
+func (h *Handler) SetTokenValidator(v TokenValidator) {
+	h.tokenValidator = v
+}
+
+// SetMetadataURL sets the OAuth protected resource metadata URL for WWW-Authenticate challenge.
+func (h *Handler) SetMetadataURL(url string) {
+	h.metadataURL = url
 }
 
 // ServeHTTP implements the HTTP transport for MCP (Streamable HTTP / SSE) with OpenAI/ChatGPT auth.
@@ -50,23 +65,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authenticate token if expectedToken is configured
-	if h.expectedToken != "" {
-		token := ""
-		authHeader := r.Header.Get("Authorization")
-		if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
-			token = strings.TrimSpace(authHeader[7:])
-		} else if apiKey := r.Header.Get("X-Api-Key"); apiKey != "" {
-			token = strings.TrimSpace(apiKey)
-		} else if qToken := r.URL.Query().Get("token"); qToken != "" {
-			token = strings.TrimSpace(qToken)
-		}
+	// Authenticate token
+	token := ""
+	authHeader := r.Header.Get("Authorization")
+	if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+		token = strings.TrimSpace(authHeader[7:])
+	} else if apiKey := r.Header.Get("X-Api-Key"); apiKey != "" {
+		token = strings.TrimSpace(apiKey)
+	} else if qToken := r.URL.Query().Get("token"); qToken != "" {
+		token = strings.TrimSpace(qToken)
+	}
 
-		if token != h.expectedToken {
-			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="Invalid or missing MCP bearer token"`)
-			writeRPCError(w, nil, CodeUnauthorized, "Unauthorized: invalid or missing MCP token", http.StatusUnauthorized)
-			return
+	isValid := false
+	if h.tokenValidator != nil {
+		isValid = h.tokenValidator(token)
+	} else if h.expectedToken != "" {
+		isValid = (token == h.expectedToken)
+	} else {
+		isValid = true
+	}
+
+	if !isValid {
+		authChallenge := `Bearer error="invalid_token", error_description="Invalid or missing MCP bearer token"`
+		if h.metadataURL != "" {
+			authChallenge = fmt.Sprintf(`Bearer error="invalid_token", resource_metadata="%s"`, h.metadataURL)
 		}
+		w.Header().Set("WWW-Authenticate", authChallenge)
+		writeRPCError(w, nil, CodeUnauthorized, "Unauthorized: invalid or missing MCP token", http.StatusUnauthorized)
+		return
 	}
 
 	// Extract or generate MCP Session ID for conversation-level isolation

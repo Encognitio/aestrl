@@ -74,8 +74,8 @@ type InputSchema struct {
 }
 
 type PropertyDef struct {
-	Type        string `json:"type"`
-	Description string `json:"description"`
+	Type        string      `json:"type"`
+	Description string      `json:"description"`
 	Default     interface{} `json:"default,omitempty"`
 }
 
@@ -103,7 +103,7 @@ func AllTools() []Tool {
 	return []Tool{
 		{
 			Name:        "connect_share",
-			Description: "Connect and authorize an Aestrl temporary share URL (e.g. https://.../s/<session>#<secret>) for inspection.",
+			Description: "Connect and authorize an Aestrl temporary share URL (https://.../s/<session>#<secret>) for inspection. Returns the share_id required for all subsequent inspection tool calls.",
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]PropertyDef{
@@ -129,15 +129,16 @@ func AllTools() []Tool {
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]PropertyDef{
+					"share_id": {
+						Type:        "string",
+						Description: "The session ID of the share returned by connect_share.",
+					},
 					"path": {
 						Type:        "string",
 						Description: "Relative directory path (e.g. '' or 'src'). Defaults to root.",
 					},
-					"share_id": {
-						Type:        "string",
-						Description: "Optional session ID if multiple shares are active. If omitted, uses default connected share.",
-					},
 				},
+				Required: []string{"share_id"},
 			},
 		},
 		{
@@ -146,6 +147,10 @@ func AllTools() []Tool {
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]PropertyDef{
+					"share_id": {
+						Type:        "string",
+						Description: "The session ID of the share returned by connect_share.",
+					},
 					"path": {
 						Type:        "string",
 						Description: "Relative directory path to start from. Defaults to root.",
@@ -154,11 +159,8 @@ func AllTools() []Tool {
 						Type:        "integer",
 						Description: "Maximum depth to recurse (1 to 10). Defaults to 3.",
 					},
-					"share_id": {
-						Type:        "string",
-						Description: "Optional session ID.",
-					},
 				},
+				Required: []string{"share_id"},
 			},
 		},
 		{
@@ -167,6 +169,10 @@ func AllTools() []Tool {
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]PropertyDef{
+					"share_id": {
+						Type:        "string",
+						Description: "The session ID of the share returned by connect_share.",
+					},
 					"query": {
 						Type:        "string",
 						Description: "Filename or pattern to search for (e.g. '*.go' or 'config').",
@@ -175,12 +181,8 @@ func AllTools() []Tool {
 						Type:        "string",
 						Description: "Relative directory to search within. Defaults to root.",
 					},
-					"share_id": {
-						Type:        "string",
-						Description: "Optional session ID.",
-					},
 				},
-				Required: []string{"query"},
+				Required: []string{"share_id", "query"},
 			},
 		},
 		{
@@ -189,6 +191,10 @@ func AllTools() []Tool {
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]PropertyDef{
+					"share_id": {
+						Type:        "string",
+						Description: "The session ID of the share returned by connect_share.",
+					},
 					"query": {
 						Type:        "string",
 						Description: "Text string or regex pattern to search for.",
@@ -201,12 +207,8 @@ func AllTools() []Tool {
 						Type:        "boolean",
 						Description: "Set to true if query is a regular expression. Defaults to false.",
 					},
-					"share_id": {
-						Type:        "string",
-						Description: "Optional session ID.",
-					},
 				},
-				Required: []string{"query"},
+				Required: []string{"share_id", "query"},
 			},
 		},
 		{
@@ -215,6 +217,10 @@ func AllTools() []Tool {
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]PropertyDef{
+					"share_id": {
+						Type:        "string",
+						Description: "The session ID of the share returned by connect_share.",
+					},
 					"path": {
 						Type:        "string",
 						Description: "Relative path of the file to read.",
@@ -227,12 +233,8 @@ func AllTools() []Tool {
 						Type:        "integer",
 						Description: "Optional ending line number (1-indexed).",
 					},
-					"share_id": {
-						Type:        "string",
-						Description: "Optional session ID.",
-					},
 				},
-				Required: []string{"path"},
+				Required: []string{"share_id", "path"},
 			},
 		},
 		{
@@ -241,16 +243,16 @@ func AllTools() []Tool {
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]PropertyDef{
+					"share_id": {
+						Type:        "string",
+						Description: "The session ID of the share returned by connect_share.",
+					},
 					"path": {
 						Type:        "string",
 						Description: "Relative path of the file or directory.",
 					},
-					"share_id": {
-						Type:        "string",
-						Description: "Optional session ID.",
-					},
 				},
-				Required: []string{"path"},
+				Required: []string{"share_id", "path"},
 			},
 		},
 		{
@@ -259,16 +261,16 @@ func AllTools() []Tool {
 			InputSchema: InputSchema{
 				Type: "object",
 				Properties: map[string]PropertyDef{
+					"share_id": {
+						Type:        "string",
+						Description: "The session ID of the share returned by connect_share.",
+					},
 					"path": {
 						Type:        "string",
 						Description: "Relative path of the file.",
 					},
-					"share_id": {
-						Type:        "string",
-						Description: "Optional session ID.",
-					},
 				},
-				Required: []string{"path"},
+				Required: []string{"share_id", "path"},
 			},
 		},
 	}

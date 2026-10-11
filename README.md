@@ -83,11 +83,17 @@ Hub: https://aestrl.dvrsfy.org
 Your permanent MCP endpoint:
 https://aestrl.dvrsfy.org/h7af8ven8/mcp
 
-ChatGPT / Custom MCP Client Setup:
-1. In ChatGPT or your MCP client, configure custom MCP:
-   - Server URL: https://aestrl.dvrsfy.org/h7af8ven8/mcp
-   - Authentication: Bearer Token
-   - Token: 3a9f02...
+ChatGPT / Custom MCP Client Configuration:
+Option A (Bearer / API Key):
+  - Server URL: https://aestrl.dvrsfy.org/h7af8ven8/mcp
+  - Authentication: Bearer Token / API Key
+  - Token: 3a9f02...
+
+Option B (OAuth 2.1):
+  - Client ID: h7af8ven8
+  - Client Secret: 3a9f02...
+  - Authorization URL: https://aestrl.dvrsfy.org/h7af8ven8/oauth/authorize
+  - Token URL: https://aestrl.dvrsfy.org/h7af8ven8/oauth/token
 
 To share a directory, run:
   aestrl share ./project
@@ -95,12 +101,11 @@ To share a directory, run:
 
 ### Step 2: Configure ChatGPT Once
 
-1. Open ChatGPT -> **Settings** -> **Connected Apps** (or Custom Actions / MCP).
+1. Open ChatGPT -> **Settings** -> **Connected Apps** (or Custom Actions / Developer Mode / MCP).
 2. Add a new MCP server:
    - **URL**: `https://aestrl.dvrsfy.org/<identity>/mcp`
-   - **Authentication**: Bearer Token / API Key
-   - **Token**: `<mcp_token>` from setup
-3. Save. This integration stays configured forever across restarts and different projects.
+   - **Authentication**: Choose **Bearer Token / API Key** (enter `<mcp_token>`), or **OAuth** (enter the Authorization and Token URLs above).
+3. Save. This integration stays configured permanently across restarts, updates, and different projects.
 
 ### Step 3: Share a Directory
 

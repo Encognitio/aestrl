@@ -221,6 +221,7 @@ func printConfigInstructions(cfg *config.Config, jsonOutput bool) {
 		return
 	}
 
+	baseURL := strings.TrimRight(cfg.HubURL, "/")
 	fmt.Printf(`Aestrl configured.
 
 Identity: %s
@@ -229,15 +230,22 @@ Hub: %s
 Your permanent MCP endpoint:
 %s
 
-ChatGPT / Custom MCP Client Setup:
-1. In ChatGPT or your MCP client, configure custom MCP:
-   - Server URL: %s
-   - Authentication: Bearer Token
-   - Token: %s
+ChatGPT / Custom MCP Client Configuration:
+Option A (Bearer / API Key):
+  - Server URL: %s
+  - Authentication: Bearer Token / API Key
+  - Token: %s
+
+Option B (OAuth 2.1):
+  - Client ID: %s
+  - Client Secret: %s
+  - Authorization URL: %s/%s/oauth/authorize
+  - Token URL: %s/%s/oauth/token
 
 To share a directory, run:
   aestrl share ./project
-`, cfg.Identity, cfg.HubURL, cfg.MCPEndpoint(), cfg.MCPEndpoint(), cfg.MCPToken)
+`, cfg.Identity, cfg.HubURL, cfg.MCPEndpoint(), cfg.MCPEndpoint(), cfg.MCPToken,
+		cfg.Identity, cfg.MCPToken, baseURL, cfg.Identity, baseURL, cfg.Identity)
 }
 
 func runHub(args []string) {

@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -680,6 +682,182 @@ func TestTraversalAndExclusionGuards(t *testing.T) {
 	_, err = eng.ReadFile(".git/config", 0, 0)
 	if err != engine.ErrAccessDenied {
 		t.Errorf("expected ErrAccessDenied for .git, got %v", err)
+	}
+}
+
+// 8. Test OAuth 2.1 RFC 8414 metadata discovery, PKCE authorization code flow and MCP token verification
+func TestOAuth21_Flow(t *testing.T) {
+	_, ts, cleanup := startTestHub(t)
+	defer cleanup()
+
+	ident := config.GenerateIdentityID()
+	hostToken, _ := config.GenerateSecureToken(16)
+	mcpToken, _ := config.GenerateSecureToken(16)
+
+	regBytes, _ := json.Marshal(hub.SetupRequest{Identity: ident, HostToken: hostToken, MCPToken: mcpToken})
+	_, _ = http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(regBytes))
+
+	cfg := &config.Config{Identity: ident, HubURL: ts.URL, HostToken: hostToken, MCPToken: mcpToken}
+	dir, cleanDir := createTestDirectory(t, "oauth-test", "OAUTH_PROTECTED_DATA")
+	defer cleanDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess, err := host.StartShare(ctx, cfg, dir, 1*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	// Step 8a: Verify protected resource metadata
+	resMeta, err := http.Get(fmt.Sprintf("%s/%s/.well-known/oauth-protected-resource", ts.URL, ident))
+	if err != nil || resMeta.StatusCode != http.StatusOK {
+		t.Fatalf("protected-resource metadata failed: status %d, err %v", resMeta.StatusCode, err)
+	}
+	var metaMap map[string]interface{}
+	_ = json.NewDecoder(resMeta.Body).Decode(&metaMap)
+	resMeta.Body.Close()
+	if !strings.Contains(metaMap["resource"].(string), "/mcp") {
+		t.Errorf("unexpected resource metadata: %+v", metaMap)
+	}
+
+	// Step 8b: Verify authorization server metadata (RFC 8414)
+	resAuthServer, err := http.Get(fmt.Sprintf("%s/%s/.well-known/oauth-authorization-server", ts.URL, ident))
+	if err != nil || resAuthServer.StatusCode != http.StatusOK {
+		t.Fatalf("authorization-server metadata failed: status %d, err %v", resAuthServer.StatusCode, err)
+	}
+	var asMap map[string]interface{}
+	_ = json.NewDecoder(resAuthServer.Body).Decode(&asMap)
+	resAuthServer.Body.Close()
+	if asMap["token_endpoint"] == "" || asMap["authorization_endpoint"] == "" {
+		t.Errorf("missing endpoints in auth server metadata: %+v", asMap)
+	}
+
+	// Step 8c: Initiate OAuth Authorization Code Flow with PKCE (S256)
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	h := sha256.Sum256([]byte(codeVerifier))
+	codeChallenge := base64.RawURLEncoding.EncodeToString(h[:])
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // don't follow redirect
+		},
+	}
+
+	redirectTarget := "https://chatgpt.com/api/aip/plugin-oauth/callback"
+	authURL := fmt.Sprintf("%s/%s/oauth/authorize?response_type=code&client_id=chatgpt-client&redirect_uri=%s&state=state123&code_challenge=%s&code_challenge_method=S256",
+		ts.URL, ident, url.QueryEscape(redirectTarget), codeChallenge)
+
+	authResp, err := client.Get(authURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authResp.Body.Close()
+
+	if authResp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 Found redirect, got %d", authResp.StatusCode)
+	}
+
+	loc := authResp.Header.Get("Location")
+	parsedLoc, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("failed to parse redirect Location: %v", err)
+	}
+	authCode := parsedLoc.Query().Get("code")
+	if authCode == "" {
+		t.Fatalf("no authorization code returned in redirect: %s", loc)
+	}
+
+	// Step 8d: Exchange Code for Access Token at token endpoint
+	tokenEndpoint := fmt.Sprintf("%s/%s/oauth/token", ts.URL, ident)
+	tokenForm := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"code_verifier": {codeVerifier},
+		"redirect_uri":  {redirectTarget},
+		"client_id":     {"chatgpt-client"},
+	}
+	tokenRes, err := http.PostForm(tokenEndpoint, tokenForm)
+	if err != nil || tokenRes.StatusCode != http.StatusOK {
+		t.Fatalf("token exchange failed: status %d, err %v", tokenRes.StatusCode, err)
+	}
+	var tokenData struct {
+		AccessToken string `json:"access_token"`
+		TokenType   string `json:"token_type"`
+	}
+	_ = json.NewDecoder(tokenRes.Body).Decode(&tokenData)
+	tokenRes.Body.Close()
+
+	if tokenData.AccessToken == "" || tokenData.TokenType != "Bearer" {
+		t.Fatalf("invalid token response: %+v", tokenData)
+	}
+
+	// Step 8e: Use newly issued OAuth access token to query /<ident>/mcp
+	mcpEndpoint := fmt.Sprintf("%s/%s/mcp", ts.URL, ident)
+
+	// Connect share using OAuth token
+	connReq := mcp.Request{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"connect_share","arguments":{"share_url":"%s"}}`, sess.ShareURL)),
+	}
+	connBytes, _ := json.Marshal(connReq)
+	req, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(connBytes))
+	req.Header.Set("Authorization", "Bearer "+tokenData.AccessToken)
+	req.Header.Set("Mcp-Session-Id", "oauth-session-1")
+	cRes, err := http.DefaultClient.Do(req)
+	if err != nil || cRes.StatusCode != http.StatusOK {
+		t.Fatalf("MCP tool call with OAuth token failed: status %d, err %v", cRes.StatusCode, err)
+	}
+	var cRPC mcp.Response
+	_ = json.NewDecoder(cRes.Body).Decode(&cRPC)
+	cRes.Body.Close()
+	if cRPC.Error != nil {
+		t.Fatalf("connect_share error: %+v", cRPC.Error)
+	}
+
+	// Read file using OAuth token
+	readReq := mcp.Request{
+		JSONRPC: "2.0",
+		ID:      2,
+		Method:  "tools/call",
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"read_file","arguments":{"share_id":"%s","path":"src/main.go"}}`, sess.SessionID)),
+	}
+	readBytes, _ := json.Marshal(readReq)
+	req, _ = http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(readBytes))
+	req.Header.Set("Authorization", "Bearer "+tokenData.AccessToken)
+	req.Header.Set("Mcp-Session-Id", "oauth-session-1")
+	rRes, err := http.DefaultClient.Do(req)
+	if err != nil || rRes.StatusCode != http.StatusOK {
+		t.Fatalf("read_file with OAuth token failed: %v", err)
+	}
+	var rRPC mcp.Response
+	_ = json.NewDecoder(rRes.Body).Decode(&rRPC)
+	rRes.Body.Close()
+	if rRPC.Error != nil {
+		t.Fatalf("read_file error: %+v", rRPC.Error)
+	}
+	text := rRPC.Result.(map[string]interface{})["content"].([]interface{})[0].(map[string]interface{})["text"].(string)
+	if !strings.Contains(text, "OAUTH_PROTECTED_DATA") {
+		t.Fatalf("expected OAUTH_PROTECTED_DATA, got:\n%s", text)
+	}
+
+	// Step 8f: Unauthorized token rejected with 401 and resource_metadata challenge
+	reqBad, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(readBytes))
+	reqBad.Header.Set("Authorization", "Bearer invalid-oauth-token")
+	badRes, err := http.DefaultClient.Do(reqBad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badRes.Body.Close()
+	if badRes.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for bad token, got %d", badRes.StatusCode)
+	}
+	challenge := badRes.Header.Get("WWW-Authenticate")
+	if !strings.Contains(challenge, "resource_metadata") {
+		t.Errorf("expected WWW-Authenticate to contain resource_metadata, got: %s", challenge)
 	}
 }
 
