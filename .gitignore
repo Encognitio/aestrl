@@ -1,0 +1,14 @@
+# Binaries
+/aestrl
+/aestrl.exe
+dist/
+bin/
+
+# Temporary and local data
+data/
+*.tmp
+*.log
+
+# OS artifacts
+.DS_Store
+Thumbs.db

@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aestrl — P2P File Inspector</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="theme-dark">
+  <header class="app-header">
+    <div class="header-left">
+      <div class="logo">
+        <span class="logo-glyph">✦</span>
+        <span class="logo-text">aestrl</span>
+      </div>
+      <div class="session-badge" id="session-badge" title="Share Session">
+        <span class="dot"></span>
+        <span id="session-name">Connecting...</span>
+      </div>
+    </div>
+
+    <div class="header-center">
+      <div class="search-box">
+        <span class="search-icon">🔍</span>
+        <input type="text" id="global-search" placeholder="Search files or content... (Ctrl+K)" autocomplete="off">
+        <kbd class="shortcut-hint">⌘K</kbd>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <div class="expiry-timer" id="expiry-timer" title="Session TTL">
+        <span class="clock-icon">⏳</span>
+        <span id="timer-text">--:--</span>
+      </div>
+      <div class="p2p-status" id="p2p-status" title="WebRTC Connection">
+        <span class="status-indicator status-connecting"></span>
+        <span id="p2p-text">Connecting P2P</span>
+      </div>
+      <button class="icon-btn theme-toggle" id="theme-toggle" aria-label="Toggle Theme" title="Toggle Light/Dark Theme">
+        🌓
+      </button>
+    </div>
+  </header>
+
+  <!-- Connection / Error Banner -->
+  <div class="banner banner-hidden" id="notice-banner"></div>
+
+  <div class="app-layout">
+    <!-- Sidebar: Directory Tree Navigation -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <span class="sidebar-title">EXPLORER</span>
+        <button class="icon-btn" id="refresh-btn" title="Refresh files">↻</button>
+      </div>
+      <div class="tree-container" id="tree-container">
+        <div class="loading-spinner"></div>
+      </div>
+    </aside>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+      <!-- Breadcrumb Bar -->
+      <nav class="breadcrumb-nav">
+        <div class="breadcrumbs" id="breadcrumbs">
+          <span class="crumb active" data-path="">root</span>
+        </div>
+        <div class="file-actions" id="file-actions" style="display: none;">
+          <button class="btn btn-sm" id="copy-path-btn" title="Copy relative path">Copy Path</button>
+          <button class="btn btn-sm" id="raw-toggle-btn" style="display: none;">Raw</button>
+          <button class="btn btn-sm btn-primary" id="download-btn">Download</button>
+        </div>
+      </nav>
+
+      <!-- View Containers -->
+      <div class="view-panel" id="view-panel">
+        <!-- Directory List View -->
+        <div class="dir-view" id="dir-view">
+          <table class="file-table">
+            <thead>
+              <tr>
+                <th class="th-name">Name</th>
+                <th class="th-size">Size</th>
+                <th class="th-date">Modified</th>
+              </tr>
+            </thead>
+            <tbody id="file-list-body">
+              <!-- Dynamically populated -->
+            </tbody>
+          </table>
+        </div>
+
+        <!-- File Viewer View -->
+        <div class="file-view" id="file-view" style="display: none;">
+          <div class="file-viewer-header">
+            <span class="file-name" id="current-file-name">filename</span>
+            <span class="file-meta" id="current-file-meta">0 lines · 0 KB</span>
+          </div>
+
+          <!-- Code / Text container -->
+          <div class="code-container" id="code-container" style="display: none;">
+            <div class="line-numbers" id="line-numbers"></div>
+            <pre class="code-body" id="code-body"><code></code></pre>
+          </div>
+
+          <!-- Markdown preview container -->
+          <div class="markdown-preview" id="markdown-container" style="display: none;"></div>
+
+          <!-- Media preview container -->
+          <div class="media-preview" id="media-container" style="display: none;"></div>
+
+          <!-- Binary preview container -->
+          <div class="binary-notice" id="binary-container" style="display: none;">
+            <div class="binary-icon">📦</div>
+            <p>This is a binary file. Inspection is available via download.</p>
+            <button class="btn btn-primary" id="binary-download-btn">Download File</button>
+          </div>
+        </div>
+
+        <!-- Search Results View -->
+        <div class="search-view" id="search-view" style="display: none;">
+          <div class="search-header">
+            <h3>Search Results</h3>
+            <span id="search-count" class="search-count">0 hits</span>
+          </div>
+          <div class="search-results-list" id="search-results-list"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
