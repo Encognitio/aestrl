@@ -174,6 +174,26 @@ func (s *Session) readLoop() {
 func (s *Session) handleHostMessage(msg *hub.HostMessage) {
 	switch msg.Action {
 	case "inspect_request":
+		if msg.SessionID != s.SessionID {
+			s.writeMessage(hub.HostMessage{
+				Action:    "inspect_response",
+				RequestID: msg.RequestID,
+				Error:     "unauthorized: session ID mismatch",
+			})
+			return
+		}
+
+		// Enforce capability secret validation
+		reqHash := sha256.Sum256([]byte(msg.Secret))
+		if hex.EncodeToString(reqHash[:]) != s.SecretHash {
+			s.writeMessage(hub.HostMessage{
+				Action:    "inspect_response",
+				RequestID: msg.RequestID,
+				Error:     "unauthorized: invalid or missing share capability secret",
+			})
+			return
+		}
+
 		res, err := s.executeInspectOp(msg.Op, msg.Args)
 		resp := hub.HostMessage{
 			Action:    "inspect_response",

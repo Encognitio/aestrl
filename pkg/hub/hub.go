@@ -65,12 +65,22 @@ type Config struct {
 	DataDir    string
 }
 
+// MCPSession tracks active shares and verified capabilities for a distinct conversation.
+type MCPSession struct {
+	ID               string
+	Identity         string
+	ActiveShareID    string
+	AuthorizedShares map[string]string // shareID -> capabilitySecret
+	LastSeen         time.Time
+}
+
 // Hub coordinates identities, hosts, MCP gateway, and WebRTC signaling.
 type Hub struct {
 	config       Config
 	identities   map[string]*IdentityRecord
 	hosts        map[string][]*HostConnection // Identity -> []*HostConnection
 	shares       map[string]*ActiveShare      // SessionID -> *ActiveShare
+	mcpSessions  map[string]*MCPSession       // SessionID -> *MCPSession
 	defaultShare map[string]string            // Identity -> SessionID
 	mu           sync.RWMutex
 	upgrader     websocket.Upgrader
@@ -91,6 +101,7 @@ func New(cfg Config, webAssets http.FileSystem) (*Hub, error) {
 		identities:   make(map[string]*IdentityRecord),
 		hosts:        make(map[string][]*HostConnection),
 		shares:       make(map[string]*ActiveShare),
+		mcpSessions:  make(map[string]*MCPSession),
 		defaultShare: make(map[string]string),
 		webAssets:    webAssets,
 		upgrader: websocket.Upgrader{
@@ -393,8 +404,8 @@ func (h *Hub) processHostMessage(hc *HostConnection, msg *HostMessage) {
 	}
 }
 
-// ForwardInspectRequest sends an inspection operation to the host and waits for the response.
-func (h *Hub) ForwardInspectRequest(share *ActiveShare, op string, args map[string]interface{}) (json.RawMessage, error) {
+// ForwardInspectRequest sends an inspection operation with verified capability secret to the host and waits for the response.
+func (h *Hub) ForwardInspectRequest(share *ActiveShare, secret string, op string, args map[string]interface{}) (json.RawMessage, error) {
 	hc := share.Host
 	if hc == nil {
 		return nil, ErrHostNotConnected
@@ -415,6 +426,7 @@ func (h *Hub) ForwardInspectRequest(share *ActiveShare, op string, args map[stri
 		Action:    "inspect_request",
 		RequestID: reqID,
 		SessionID: share.SessionID,
+		Secret:    secret,
 		Op:        op,
 		Args:      args,
 	}
@@ -477,7 +489,7 @@ func (h *Hub) handleInspect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.ForwardInspectRequest(share, req.Op, req.Args)
+	result, err := h.ForwardInspectRequest(share, req.Secret, req.Op, req.Args)
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		_ = json.NewEncoder(w).Encode(InspectResponse{Error: err.Error()})
@@ -637,26 +649,42 @@ type hubExecutor struct {
 	identity string
 }
 
-func (e *hubExecutor) resolveShare(shareID string) (*ActiveShare, error) {
+func (e *hubExecutor) resolveShare(mcpSessionID, shareID string) (*ActiveShare, string, error) {
 	e.hub.mu.RLock()
 	defer e.hub.mu.RUnlock()
 
-	if shareID == "" {
-		shareID = e.hub.defaultShare[e.identity]
+	sess := e.hub.mcpSessions[mcpSessionID]
+	if shareID == "" && sess != nil {
+		shareID = sess.ActiveShareID
 	}
 
 	if shareID == "" {
-		return nil, errors.New("no active share selected; use connect_share(share_url) to authorize a share")
+		return nil, "", errors.New("no active share selected; use connect_share(share_url) to authorize a share first")
 	}
 
 	share, exists := e.hub.shares[shareID]
 	if !exists || time.Now().After(share.ExpiresAt) {
-		return nil, ErrShareNotFound
+		return nil, "", ErrShareNotFound
 	}
-	return share, nil
+
+	// Enforce Identity Isolation
+	if share.Identity != e.identity {
+		return nil, "", errors.New("share session not found under this identity")
+	}
+
+	// Enforce Capability Validation for this conversation
+	secret := ""
+	if sess != nil {
+		secret = sess.AuthorizedShares[shareID]
+	}
+	if secret == "" {
+		return nil, "", errors.New("unauthorized: share has not been connected in this conversation; call connect_share(share_url) first")
+	}
+
+	return share, secret, nil
 }
 
-func (e *hubExecutor) ConnectShare(shareURL string) (interface{}, error) {
+func (e *hubExecutor) ConnectShare(mcpSessionID, shareURL string) (interface{}, error) {
 	parsed, err := url.Parse(shareURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid share URL: %w", err)
@@ -676,109 +704,128 @@ func (e *hubExecutor) ConnectShare(shareURL string) (interface{}, error) {
 
 	secret := parsed.Fragment
 	if secret == "" {
-		// Try query param
 		secret = parsed.Query().Get("secret")
+	}
+	if secret == "" {
+		return nil, errors.New("missing capability secret in share URL (must include #<secret>)")
 	}
 
 	e.hub.mu.Lock()
+	defer e.hub.mu.Unlock()
+
 	share, exists := e.hub.shares[sessionID]
 	if !exists || time.Now().After(share.ExpiresAt) {
-		e.hub.mu.Unlock()
-		return nil, fmt.Errorf("share session '%s' is not active or expired", sessionID)
+		return nil, fmt.Errorf("share session '%s' is not active or has expired", sessionID)
 	}
 
-	// Verify secret hash if provided
-	if secret != "" {
-		hash := sha256.Sum256([]byte(secret))
-		if hex.EncodeToString(hash[:]) != share.SecretHash {
-			e.hub.mu.Unlock()
-			return nil, ErrShareUnauthorized
+	// Enforce Identity Isolation
+	if share.Identity != e.identity {
+		return nil, fmt.Errorf("share session '%s' does not belong to this identity", sessionID)
+	}
+
+	// Enforce Capability Secret validation against share's secret hash
+	hash := sha256.Sum256([]byte(secret))
+	if hex.EncodeToString(hash[:]) != share.SecretHash {
+		return nil, ErrShareUnauthorized
+	}
+
+	// Record authorized capability strictly in this conversation's MCP session
+	sess, exists := e.hub.mcpSessions[mcpSessionID]
+	if !exists {
+		sess = &MCPSession{
+			ID:               mcpSessionID,
+			Identity:         e.identity,
+			AuthorizedShares: make(map[string]string),
 		}
+		e.hub.mcpSessions[mcpSessionID] = sess
 	}
-
-	// Set as default share for this identity
-	e.hub.defaultShare[e.identity] = sessionID
-	e.hub.mu.Unlock()
+	sess.ActiveShareID = sessionID
+	sess.AuthorizedShares[sessionID] = secret
+	sess.LastSeen = time.Now()
 
 	return map[string]interface{}{
 		"status":     "connected",
-		"session_id": share.SessionID,
+		"share_id":   share.SessionID,
 		"name":       share.Name,
 		"expires_at": share.ExpiresAt.Format(time.RFC3339),
-		"message":    fmt.Sprintf("Successfully connected share '%s' (session: %s). Read-only file inspection tools are now active.", share.Name, share.SessionID),
+		"message":    fmt.Sprintf("Successfully authorized and connected share '%s' (share_id: '%s'). Read-only file inspection tools are now active for this conversation.", share.Name, share.SessionID),
 	}, nil
 }
 
-func (e *hubExecutor) ListShares() (interface{}, error) {
+func (e *hubExecutor) ListShares(mcpSessionID string) (interface{}, error) {
 	e.hub.mu.RLock()
 	defer e.hub.mu.RUnlock()
 
+	sess := e.hub.mcpSessions[mcpSessionID]
 	var shares []ShareMeta
 	for _, s := range e.hub.shares {
 		if s.Identity == e.identity && time.Now().Before(s.ExpiresAt) {
-			shares = append(shares, ShareMeta{
-				SessionID: s.SessionID,
-				Name:      s.Name,
-				ExpiresAt: s.ExpiresAt,
-				Active:    true,
-			})
+			// Only list shares that have been authorized for this conversation
+			if sess != nil && sess.AuthorizedShares[s.SessionID] != "" {
+				shares = append(shares, ShareMeta{
+					SessionID: s.SessionID,
+					Name:      s.Name,
+					ExpiresAt: s.ExpiresAt,
+					Active:    true,
+				})
+			}
 		}
 	}
 	return shares, nil
 }
 
-func (e *hubExecutor) ListDirectory(shareID, path string) (interface{}, error) {
-	share, err := e.resolveShare(shareID)
+func (e *hubExecutor) ListDirectory(mcpSessionID, shareID, path string) (interface{}, error) {
+	share, secret, err := e.resolveShare(mcpSessionID, shareID)
 	if err != nil {
 		return nil, err
 	}
-	return e.hub.ForwardInspectRequest(share, "list_directory", map[string]interface{}{"path": path})
+	return e.hub.ForwardInspectRequest(share, secret, "list_directory", map[string]interface{}{"path": path})
 }
 
-func (e *hubExecutor) Tree(shareID, path string, depth int) (interface{}, error) {
-	share, err := e.resolveShare(shareID)
+func (e *hubExecutor) Tree(mcpSessionID, shareID, path string, depth int) (interface{}, error) {
+	share, secret, err := e.resolveShare(mcpSessionID, shareID)
 	if err != nil {
 		return nil, err
 	}
-	return e.hub.ForwardInspectRequest(share, "tree", map[string]interface{}{"path": path, "depth": depth})
+	return e.hub.ForwardInspectRequest(share, secret, "tree", map[string]interface{}{"path": path, "depth": depth})
 }
 
-func (e *hubExecutor) SearchFiles(shareID, query, path string) (interface{}, error) {
-	share, err := e.resolveShare(shareID)
+func (e *hubExecutor) SearchFiles(mcpSessionID, shareID, query, path string) (interface{}, error) {
+	share, secret, err := e.resolveShare(mcpSessionID, shareID)
 	if err != nil {
 		return nil, err
 	}
-	return e.hub.ForwardInspectRequest(share, "search_files", map[string]interface{}{"query": query, "path": path})
+	return e.hub.ForwardInspectRequest(share, secret, "search_files", map[string]interface{}{"query": query, "path": path})
 }
 
-func (e *hubExecutor) SearchContent(shareID, query, path string, isRegex bool) (interface{}, error) {
-	share, err := e.resolveShare(shareID)
+func (e *hubExecutor) SearchContent(mcpSessionID, shareID, query, path string, isRegex bool) (interface{}, error) {
+	share, secret, err := e.resolveShare(mcpSessionID, shareID)
 	if err != nil {
 		return nil, err
 	}
-	return e.hub.ForwardInspectRequest(share, "search_content", map[string]interface{}{"query": query, "path": path, "is_regex": isRegex})
+	return e.hub.ForwardInspectRequest(share, secret, "search_content", map[string]interface{}{"query": query, "path": path, "is_regex": isRegex})
 }
 
-func (e *hubExecutor) ReadFile(shareID, path string, startLine, endLine int) (interface{}, error) {
-	share, err := e.resolveShare(shareID)
+func (e *hubExecutor) ReadFile(mcpSessionID, shareID, path string, startLine, endLine int) (interface{}, error) {
+	share, secret, err := e.resolveShare(mcpSessionID, shareID)
 	if err != nil {
 		return nil, err
 	}
-	return e.hub.ForwardInspectRequest(share, "read_file", map[string]interface{}{"path": path, "start_line": startLine, "end_line": endLine})
+	return e.hub.ForwardInspectRequest(share, secret, "read_file", map[string]interface{}{"path": path, "start_line": startLine, "end_line": endLine})
 }
 
-func (e *hubExecutor) FileInfo(shareID, path string) (interface{}, error) {
-	share, err := e.resolveShare(shareID)
+func (e *hubExecutor) FileInfo(mcpSessionID, shareID, path string) (interface{}, error) {
+	share, secret, err := e.resolveShare(mcpSessionID, shareID)
 	if err != nil {
 		return nil, err
 	}
-	return e.hub.ForwardInspectRequest(share, "file_info", map[string]interface{}{"path": path})
+	return e.hub.ForwardInspectRequest(share, secret, "file_info", map[string]interface{}{"path": path})
 }
 
-func (e *hubExecutor) GetFile(shareID, path string) (interface{}, error) {
-	share, err := e.resolveShare(shareID)
+func (e *hubExecutor) GetFile(mcpSessionID, shareID, path string) (interface{}, error) {
+	share, secret, err := e.resolveShare(mcpSessionID, shareID)
 	if err != nil {
 		return nil, err
 	}
-	return e.hub.ForwardInspectRequest(share, "get_file", map[string]interface{}{"path": path})
+	return e.hub.ForwardInspectRequest(share, secret, "get_file", map[string]interface{}{"path": path})
 }

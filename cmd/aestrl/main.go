@@ -129,6 +129,15 @@ func runSetup(args []string) {
 	// Check if already configured
 	if !*reset {
 		if existing, err := config.Load(cfgPath); err == nil && existing.Identity != "" {
+			targetHub := strings.TrimRight(existing.HubURL, "/")
+			if *hubURL != config.DefaultHubURL {
+				targetHub = strings.TrimRight(*hubURL, "/")
+				existing.HubURL = targetHub
+			}
+			if err := verifyHubRegistration(targetHub, existing.Identity, existing.HostToken, existing.MCPToken); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: Existing identity verification failed against hub at %s: %v\nRun 'aestrl setup --reset' to generate a new identity.\n", targetHub, err)
+				os.Exit(1)
+			}
 			printConfigInstructions(existing, *jsonOutput)
 			return
 		}
@@ -148,6 +157,11 @@ func runSetup(args []string) {
 	}
 
 	targetHub := strings.TrimRight(*hubURL, "/")
+	if err := verifyHubRegistration(targetHub, identityID, hostToken, mcpToken); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: Failed to register persistent identity with hub at %s: %v\n", targetHub, err)
+		os.Exit(1)
+	}
+
 	cfg := &config.Config{
 		Identity:   identityID,
 		HubURL:     targetHub,
@@ -157,25 +171,47 @@ func runSetup(args []string) {
 		CreatedAt:  time.Now(),
 	}
 
-	// Register with hub if reachable
-	regPayload := hub.SetupRequest{
-		Identity:  identityID,
-		HostToken: hostToken,
-		MCPToken:  mcpToken,
-	}
-	regBytes, _ := json.Marshal(regPayload)
-	setupURL := fmt.Sprintf("%s/api/setup", targetHub)
-	resp, err := http.Post(setupURL, "application/json", bytes.NewReader(regBytes))
-	if err == nil {
-		_ = resp.Body.Close()
-	}
-
 	if err := cfg.Save(cfgPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
 		os.Exit(1)
 	}
 
 	printConfigInstructions(cfg, *jsonOutput)
+}
+
+func verifyHubRegistration(hubURL, identity, hostToken, mcpToken string) error {
+	regPayload := hub.SetupRequest{
+		Identity:  identity,
+		HostToken: hostToken,
+		MCPToken:  mcpToken,
+	}
+	regBytes, err := json.Marshal(regPayload)
+	if err != nil {
+		return err
+	}
+
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	setupURL := fmt.Sprintf("%s/api/setup", hubURL)
+	resp, err := httpClient.Post(setupURL, "application/json", bytes.NewReader(regBytes))
+	if err != nil {
+		return fmt.Errorf("network connection error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("hub returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var setupResp hub.SetupResponse
+	if err := json.Unmarshal(body, &setupResp); err != nil {
+		return fmt.Errorf("invalid hub JSON response: %w", err)
+	}
+
+	if setupResp.Status != "created" && setupResp.Status != "verified" {
+		return fmt.Errorf("unexpected hub status '%s'", setupResp.Status)
+	}
+	return nil
 }
 
 func printConfigInstructions(cfg *config.Config, jsonOutput bool) {

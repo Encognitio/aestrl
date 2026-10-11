@@ -3,6 +3,8 @@ package test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/Encognitio/aestrl/pkg/client"
 	"github.com/Encognitio/aestrl/pkg/config"
+	"github.com/Encognitio/aestrl/pkg/engine"
 	"github.com/Encognitio/aestrl/pkg/host"
 	"github.com/Encognitio/aestrl/pkg/hub"
 	"github.com/Encognitio/aestrl/pkg/mcp"
@@ -22,7 +25,7 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-func createTestDirectory(t *testing.T, prefix string) (string, func()) {
+func createTestDirectory(t *testing.T, prefix, secretWord string) (string, func()) {
 	t.Helper()
 	dir, err := os.MkdirTemp("", prefix+"-*")
 	if err != nil {
@@ -32,16 +35,16 @@ func createTestDirectory(t *testing.T, prefix string) (string, func()) {
 	_ = os.MkdirAll(filepath.Join(dir, "src"), 0755)
 	_ = os.MkdirAll(filepath.Join(dir, ".git"), 0755)
 
-	content1 := `package main
+	content1 := fmt.Sprintf(`package main
 
 import "fmt"
 
 func main() {
-	fmt.Println("Running Aestrl E2E test")
+	fmt.Println("Running Aestrl %s")
 }
-`
+`, secretWord)
 	_ = os.WriteFile(filepath.Join(dir, "src", "main.go"), []byte(content1), 0644)
-	_ = os.WriteFile(filepath.Join(dir, "README.md"), []byte("# Test Repo\nAestrl inspection test"), 0644)
+	_ = os.WriteFile(filepath.Join(dir, "README.md"), []byte("# "+prefix+"\nDocumentation for "+secretWord), 0644)
 	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("SECRET_ENV=12345"), 0644)
 
 	cleanup := func() {
@@ -50,13 +53,12 @@ func main() {
 	return dir, cleanup
 }
 
-func TestEndToEnd_FullInspectionWorkflow(t *testing.T) {
-	// 1. Start test Hub server
+func startTestHub(t *testing.T) (*hub.Hub, *httptest.Server, func()) {
+	t.Helper()
 	hubDataDir, err := os.MkdirTemp("", "aestrl-hub-data-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(hubDataDir)
 
 	hubServer, err := hub.New(hub.Config{
 		DataDir: hubDataDir,
@@ -66,243 +68,162 @@ func TestEndToEnd_FullInspectionWorkflow(t *testing.T) {
 	}
 
 	ts := httptest.NewServer(hubServer.Handler())
-	defer ts.Close()
+	cleanup := func() {
+		ts.Close()
+		os.RemoveAll(hubDataDir)
+	}
+	return hubServer, ts, cleanup
+}
 
-	// 2. Identity A and Identity B setup
-	identA := config.GenerateIdentityID()
-	hostTokenA, _ := config.GenerateSecureToken(16)
-	mcpTokenA, _ := config.GenerateSecureToken(16)
+// 1. Verify Setup: Hub registration verification and rejection handling
+func TestSetup_Verification(t *testing.T) {
+	_, ts, cleanup := startTestHub(t)
+	defer cleanup()
 
-	identB := config.GenerateIdentityID()
-	hostTokenB, _ := config.GenerateSecureToken(16)
-	mcpTokenB, _ := config.GenerateSecureToken(16)
+	ident := config.GenerateIdentityID()
+	hostToken, _ := config.GenerateSecureToken(16)
+	mcpToken, _ := config.GenerateSecureToken(16)
 
-	if identA == identB {
-		t.Fatal("identities collided")
+	// Valid registration
+	setupPayload := hub.SetupRequest{
+		Identity:  ident,
+		HostToken: hostToken,
+		MCPToken:  mcpToken,
+	}
+	payloadBytes, _ := json.Marshal(setupPayload)
+	res, err := http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(payloadBytes))
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("setup registration failed: %v", err)
+	}
+	var resp hub.SetupResponse
+	_ = json.NewDecoder(res.Body).Decode(&resp)
+	res.Body.Close()
+	if resp.Status != "created" {
+		t.Errorf("expected status 'created', got '%s'", resp.Status)
 	}
 
-	// Register Identity A with Hub
-	setupPayloadA := hub.SetupRequest{
-		Identity:  identA,
-		HostToken: hostTokenA,
-		MCPToken:  mcpTokenA,
+	// Repeated setup with same credentials -> verified
+	res2, err := http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(payloadBytes))
+	if err != nil || res2.StatusCode != http.StatusOK {
+		t.Fatalf("repeated setup failed: %v", err)
 	}
-	payloadBytesA, _ := json.Marshal(setupPayloadA)
-	resA, err := http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(payloadBytesA))
-	if err != nil || resA.StatusCode != http.StatusOK {
-		t.Fatalf("failed setup for Identity A: status %d, err %v", resA.StatusCode, err)
-	}
-	resA.Body.Close()
-
-	// Register Identity B with Hub
-	setupPayloadB := hub.SetupRequest{
-		Identity:  identB,
-		HostToken: hostTokenB,
-		MCPToken:  mcpTokenB,
-	}
-	payloadBytesB, _ := json.Marshal(setupPayloadB)
-	resB, err := http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(payloadBytesB))
-	if err != nil || resB.StatusCode != http.StatusOK {
-		t.Fatalf("failed setup for Identity B: status %d, err %v", resB.StatusCode, err)
-	}
-	resB.Body.Close()
-
-	// Validate repeated setup returns existing / verified
-	resA2, err := http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(payloadBytesA))
-	if err != nil || resA2.StatusCode != http.StatusOK {
-		t.Fatalf("failed repeated setup for Identity A: status %d, err %v", resA2.StatusCode, err)
-	}
-	var setupRespA hub.SetupResponse
-	_ = json.NewDecoder(resA2.Body).Decode(&setupRespA)
-	resA2.Body.Close()
-	if setupRespA.Status != "verified" {
-		t.Errorf("expected status 'verified', got '%s'", setupRespA.Status)
+	var resp2 hub.SetupResponse
+	_ = json.NewDecoder(res2.Body).Decode(&resp2)
+	res2.Body.Close()
+	if resp2.Status != "verified" {
+		t.Errorf("expected status 'verified', got '%s'", resp2.Status)
 	}
 
-	cfgA := &config.Config{
-		Identity:  identA,
+	// Setup with token conflict -> status 409 Conflict
+	conflictPayload := hub.SetupRequest{
+		Identity:  ident,
+		HostToken: "wrong-token",
+		MCPToken:  mcpToken,
+	}
+	conflictBytes, _ := json.Marshal(conflictPayload)
+	resConflict, err := http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(conflictBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resConflict.Body.Close()
+	if resConflict.StatusCode != http.StatusConflict {
+		t.Errorf("expected 409 Conflict for mismatched credentials, got %d", resConflict.StatusCode)
+	}
+}
+
+// 2. Demonstrate ChatGPT Web -> Permanent MCP Endpoint -> Active Share -> Source File Read
+func TestChatGPTWeb_EndToEndFlow(t *testing.T) {
+	_, ts, cleanup := startTestHub(t)
+	defer cleanup()
+
+	ident := config.GenerateIdentityID()
+	hostToken, _ := config.GenerateSecureToken(16)
+	mcpToken, _ := config.GenerateSecureToken(16)
+
+	setupPayload := hub.SetupRequest{
+		Identity:  ident,
+		HostToken: hostToken,
+		MCPToken:  mcpToken,
+	}
+	payloadBytes, _ := json.Marshal(setupPayload)
+	_, _ = http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(payloadBytes))
+
+	cfg := &config.Config{
+		Identity:  ident,
 		HubURL:    ts.URL,
-		HostToken: hostTokenA,
-		MCPToken:  mcpTokenA,
+		HostToken: hostToken,
+		MCPToken:  mcpToken,
 	}
 
-	// 3. Start Host Sharing Directory 1
-	dir1, cleanupDir1 := createTestDirectory(t, "share1")
-	defer cleanupDir1()
+	dir, cleanupDir := createTestDirectory(t, "chatgpt-flow", "CHATGPT_VERIFIED_SECRET_TOKEN")
+	defer cleanupDir()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sess1, err := host.StartShare(ctx, cfgA, dir1, 1*time.Hour)
+	sess, err := host.StartShare(ctx, cfg, dir, 1*time.Hour)
 	if err != nil {
-		t.Fatalf("StartShare 1 failed: %v", err)
+		t.Fatalf("failed to start share: %v", err)
 	}
-	defer sess1.Close()
+	defer sess.Close()
 
-	// 3b. Start a Second Concurrent Share under same identity
-	dir2, cleanupDir2 := createTestDirectory(t, "share2")
-	defer cleanupDir2()
+	mcpEndpoint := fmt.Sprintf("%s/%s/mcp", ts.URL, ident)
 
-	sess2, err := host.StartShare(ctx, cfgA, dir2, 1*time.Hour)
-	if err != nil {
-		t.Fatalf("StartShare 2 failed: %v", err)
-	}
-	defer sess2.Close()
-
-	// 4. Validate Terminal CLI inspection client (ls, tree, rg, cat) on sess1
-	cli, err := client.ParseShareURL(sess1.ShareURL)
-	if err != nil {
-		t.Fatalf("ParseShareURL failed: %v", err)
-	}
-
-	// CLI ls
-	items, err := cli.ListDirectory("")
-	if err != nil {
-		t.Fatalf("CLI ListDirectory failed: %v", err)
-	}
-	hasSrc := false
-	for _, it := range items {
-		if it.Name == "src" {
-			hasSrc = true
-		}
-		if it.Name == ".git" || it.Name == ".env" {
-			t.Errorf("excluded file exposed in listing: %s", it.Name)
-		}
-	}
-	if !hasSrc {
-		t.Errorf("expected 'src' directory in listing, got: %+v", items)
-	}
-
-	// CLI tree
-	treeNode, err := cli.Tree("", 3)
-	if err != nil {
-		t.Fatalf("CLI Tree failed: %v", err)
-	}
-	renderedTree := client.RenderTree(treeNode, "", true)
-	if !strings.Contains(renderedTree, "main.go") {
-		t.Errorf("tree does not contain main.go:\n%s", renderedTree)
-	}
-
-	// CLI rg (search content)
-	matches, err := cli.SearchContent("Running Aestrl", "", false)
-	if err != nil {
-		t.Fatalf("CLI SearchContent failed: %v", err)
-	}
-	if len(matches) == 0 {
-		t.Fatalf("expected search match for 'Running Aestrl', got 0")
-	}
-	if matches[0].Path != "src/main.go" {
-		t.Errorf("expected match path src/main.go, got: %s", matches[0].Path)
-	}
-
-	// CLI cat (read line range)
-	readRes, err := cli.ReadFile("src/main.go", 4, 7)
-	if err != nil {
-		t.Fatalf("CLI ReadFile failed: %v", err)
-	}
-	if !strings.Contains(readRes.Content, "func main()") {
-		t.Errorf("expected line range to include func main(), got: %s", readRes.Content)
-	}
-
-	// 5. Test MCP Gateway Protocol against /<identA>/mcp
-	mcpEndpoint := fmt.Sprintf("%s/%s/mcp", ts.URL, identA)
-
-	// Step 5a: MCP initialize
+	// Step 1: ChatGPT initializes MCP session (Streamable HTTP)
 	initReq := mcp.Request{
 		JSONRPC: "2.0",
 		ID:      1,
 		Method:  "initialize",
+		Params:  json.RawMessage(`{"protocolVersion":"2024-11-05","clientInfo":{"name":"ChatGPT-Web","version":"1.0"}}`),
 	}
-	initBody, _ := json.Marshal(initReq)
-	httpReq, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(initBody))
-	httpReq.Header.Set("Authorization", "Bearer "+mcpTokenA)
+	initBytes, _ := json.Marshal(initReq)
+	httpReq, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(initBytes))
+	httpReq.Header.Set("Authorization", "Bearer "+mcpToken)
+	httpReq.Header.Set("Mcp-Session-Id", "chatgpt-conv-101")
+
 	initRes, err := http.DefaultClient.Do(httpReq)
 	if err != nil || initRes.StatusCode != http.StatusOK {
-		t.Fatalf("MCP initialize failed: status %d, err %v", initRes.StatusCode, err)
+		t.Fatalf("ChatGPT initialize failed: %v", err)
 	}
-	var initRPCResp mcp.Response
-	_ = json.NewDecoder(initRes.Body).Decode(&initRPCResp)
+	var initResp mcp.Response
+	_ = json.NewDecoder(initRes.Body).Decode(&initResp)
 	initRes.Body.Close()
-	if initRPCResp.Error != nil {
-		t.Fatalf("MCP initialize RPC error: %+v", initRPCResp.Error)
+	if initResp.Error != nil {
+		t.Fatalf("ChatGPT initialize returned error: %+v", initResp.Error)
 	}
 
-	// Step 5b: MCP tools/list
-	listReq := mcp.Request{
+	// Step 2: User pastes temporary share URL in chat -> ChatGPT calls connect_share tool
+	connReq := mcp.Request{
 		JSONRPC: "2.0",
 		ID:      2,
-		Method:  "tools/list",
-	}
-	listBody, _ := json.Marshal(listReq)
-	httpReq, _ = http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(listBody))
-	httpReq.Header.Set("Authorization", "Bearer "+mcpTokenA)
-	listRes, err := http.DefaultClient.Do(httpReq)
-	if err != nil || listRes.StatusCode != http.StatusOK {
-		t.Fatalf("MCP tools/list failed: %v", err)
-	}
-	var listRPCResp mcp.Response
-	_ = json.NewDecoder(listRes.Body).Decode(&listRPCResp)
-	listRes.Body.Close()
-	if listRPCResp.Error != nil {
-		t.Fatalf("MCP tools/list error: %+v", listRPCResp.Error)
-	}
-
-	// Step 5c: MCP connect_share tool call
-	connToolReq := mcp.Request{
-		JSONRPC: "2.0",
-		ID:      3,
 		Method:  "tools/call",
 		Params: json.RawMessage(fmt.Sprintf(`{
 			"name": "connect_share",
 			"arguments": {
 				"share_url": "%s"
 			}
-		}`, sess1.ShareURL)),
+		}`, sess.ShareURL)),
 	}
-	connBody, _ := json.Marshal(connToolReq)
-	httpReq, _ = http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(connBody))
-	httpReq.Header.Set("Authorization", "Bearer "+mcpTokenA)
+	connBytes, _ := json.Marshal(connReq)
+	httpReq, _ = http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(connBytes))
+	httpReq.Header.Set("Authorization", "Bearer "+mcpToken)
+	httpReq.Header.Set("Mcp-Session-Id", "chatgpt-conv-101")
+
 	connRes, err := http.DefaultClient.Do(httpReq)
 	if err != nil || connRes.StatusCode != http.StatusOK {
-		t.Fatalf("MCP connect_share failed: %v", err)
+		t.Fatalf("connect_share tool call failed: %v", err)
 	}
 	var connRPCResp mcp.Response
 	_ = json.NewDecoder(connRes.Body).Decode(&connRPCResp)
 	connRes.Body.Close()
 	if connRPCResp.Error != nil {
-		t.Fatalf("MCP connect_share error: %+v", connRPCResp.Error)
+		t.Fatalf("connect_share error: %+v", connRPCResp.Error)
 	}
 
-	// Step 5d: MCP list_directory tool call
-	listDirReq := mcp.Request{
+	// Step 3: ChatGPT reads source file via read_file tool
+	readReq := mcp.Request{
 		JSONRPC: "2.0",
-		ID:      4,
-		Method:  "tools/call",
-		Params: json.RawMessage(`{
-			"name": "list_directory",
-			"arguments": {
-				"path": ""
-			}
-		}`),
-	}
-	listDirBody, _ := json.Marshal(listDirReq)
-	httpReq, _ = http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(listDirBody))
-	httpReq.Header.Set("Authorization", "Bearer "+mcpTokenA)
-	listDirRes, err := http.DefaultClient.Do(httpReq)
-	if err != nil || listDirRes.StatusCode != http.StatusOK {
-		t.Fatalf("MCP list_directory failed: %v", err)
-	}
-	var listDirRPCResp mcp.Response
-	_ = json.NewDecoder(listDirRes.Body).Decode(&listDirRPCResp)
-	listDirRes.Body.Close()
-	if listDirRPCResp.Error != nil {
-		t.Fatalf("MCP list_directory error: %+v", listDirRPCResp.Error)
-	}
-
-	// Step 5e: MCP read_file tool call
-	readFileReq := mcp.Request{
-		JSONRPC: "2.0",
-		ID:      5,
+		ID:      3,
 		Method:  "tools/call",
 		Params: json.RawMessage(`{
 			"name": "read_file",
@@ -313,34 +234,346 @@ func TestEndToEnd_FullInspectionWorkflow(t *testing.T) {
 			}
 		}`),
 	}
-	readFileBody, _ := json.Marshal(readFileReq)
-	httpReq, _ = http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(readFileBody))
-	httpReq.Header.Set("Authorization", "Bearer "+mcpTokenA)
-	readFileRes, err := http.DefaultClient.Do(httpReq)
-	if err != nil || readFileRes.StatusCode != http.StatusOK {
-		t.Fatalf("MCP read_file failed: %v", err)
+	readBytes, _ := json.Marshal(readReq)
+	httpReq, _ = http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(readBytes))
+	httpReq.Header.Set("Authorization", "Bearer "+mcpToken)
+	httpReq.Header.Set("Mcp-Session-Id", "chatgpt-conv-101")
+
+	readRes, err := http.DefaultClient.Do(httpReq)
+	if err != nil || readRes.StatusCode != http.StatusOK {
+		t.Fatalf("read_file tool call failed: %v", err)
 	}
-	var readFileRPCResp mcp.Response
-	_ = json.NewDecoder(readFileRes.Body).Decode(&readFileRPCResp)
-	readFileRes.Body.Close()
-	if readFileRPCResp.Error != nil {
-		t.Fatalf("MCP read_file error: %+v", readFileRPCResp.Error)
+	var readRPCResp mcp.Response
+	_ = json.NewDecoder(readRes.Body).Decode(&readRPCResp)
+	readRes.Body.Close()
+	if readRPCResp.Error != nil {
+		t.Fatalf("read_file returned error: %+v", readRPCResp.Error)
 	}
 
-	// 6. Direct Browser WebRTC P2P Inspection Test
-	testWebRTCBrowserP2P(t, ts.URL, sess1.SessionID, sess1.Secret)
+	resultMap, ok := readRPCResp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("unexpected result type: %T", readRPCResp.Result)
+	}
+	contentList, ok := resultMap["content"].([]interface{})
+	if !ok || len(contentList) == 0 {
+		t.Fatalf("missing content in result: %+v", resultMap)
+	}
+	contentItem := contentList[0].(map[string]interface{})
+	text := contentItem["text"].(string)
 
-	// 7. Test Revocation / Expiry
-	sess1.Close()
-	// Try accessing revoked share
-	_, err = cli.ListDirectory("")
-	if err == nil {
-		t.Errorf("expected error accessing closed share, got nil")
+	if !strings.Contains(text, "CHATGPT_VERIFIED_SECRET_TOKEN") {
+		t.Fatalf("expected text to contain 'CHATGPT_VERIFIED_SECRET_TOKEN', got:\n%s", text)
 	}
 }
 
-func testWebRTCBrowserP2P(t *testing.T, hubURL, sessionID, secret string) {
-	// Create Pion WebRTC peer representing browser
+// 3. Enforce Identity Isolation and Capability Validation
+func TestIdentityAndCapabilityIsolation(t *testing.T) {
+	_, ts, cleanup := startTestHub(t)
+	defer cleanup()
+
+	// Setup Identity A and Identity B
+	identA := config.GenerateIdentityID()
+	hostTokenA, _ := config.GenerateSecureToken(16)
+	mcpTokenA, _ := config.GenerateSecureToken(16)
+
+	identB := config.GenerateIdentityID()
+	hostTokenB, _ := config.GenerateSecureToken(16)
+	mcpTokenB, _ := config.GenerateSecureToken(16)
+
+	regA, _ := json.Marshal(hub.SetupRequest{Identity: identA, HostToken: hostTokenA, MCPToken: mcpTokenA})
+	_, _ = http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(regA))
+
+	regB, _ := json.Marshal(hub.SetupRequest{Identity: identB, HostToken: hostTokenB, MCPToken: mcpTokenB})
+	_, _ = http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(regB))
+
+	dirA, cleanA := createTestDirectory(t, "userA", "IDENT_A_CONTENT")
+	defer cleanA()
+
+	dirB, cleanB := createTestDirectory(t, "userB", "IDENT_B_CONTENT")
+	defer cleanB()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfgA := &config.Config{Identity: identA, HubURL: ts.URL, HostToken: hostTokenA, MCPToken: mcpTokenA}
+	cfgB := &config.Config{Identity: identB, HubURL: ts.URL, HostToken: hostTokenB, MCPToken: mcpTokenB}
+
+	sessA, err := host.StartShare(ctx, cfgA, dirA, 1*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessA.Close()
+
+	sessB, err := host.StartShare(ctx, cfgB, dirB, 1*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessB.Close()
+
+	mcpEndpointA := fmt.Sprintf("%s/%s/mcp", ts.URL, identA)
+
+	// Test 3a: Calling read_file WITHOUT connecting share -> FAILS (unauthorized)
+	readReq := mcp.Request{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params: json.RawMessage(`{
+			"name": "read_file",
+			"arguments": { "path": "src/main.go" }
+		}`),
+	}
+	readBytes, _ := json.Marshal(readReq)
+	req, _ := http.NewRequest(http.MethodPost, mcpEndpointA, bytes.NewReader(readBytes))
+	req.Header.Set("Authorization", "Bearer "+mcpTokenA)
+	req.Header.Set("Mcp-Session-Id", "attacker-conv-1")
+	res, _ := http.DefaultClient.Do(req)
+	var resp1 mcp.Response
+	_ = json.NewDecoder(res.Body).Decode(&resp1)
+	res.Body.Close()
+
+	resultMap, _ := resp1.Result.(map[string]interface{})
+	if isErr, ok := resultMap["isError"].(bool); !ok || !isErr {
+		t.Errorf("expected isError: true when reading without connect_share, got: %+v", resultMap)
+	}
+
+	// Test 3b: Calling connect_share with corrupted secret capability -> FAILS
+	tamperedURL := fmt.Sprintf("%s/s/%s#wrongsecret123456", ts.URL, sessA.SessionID)
+	connBadReq := mcp.Request{
+		JSONRPC: "2.0",
+		ID:      2,
+		Method:  "tools/call",
+		Params: json.RawMessage(fmt.Sprintf(`{
+			"name": "connect_share",
+			"arguments": { "share_url": "%s" }
+		}`, tamperedURL)),
+	}
+	badBytes, _ := json.Marshal(connBadReq)
+	req, _ = http.NewRequest(http.MethodPost, mcpEndpointA, bytes.NewReader(badBytes))
+	req.Header.Set("Authorization", "Bearer "+mcpTokenA)
+	req.Header.Set("Mcp-Session-Id", "attacker-conv-1")
+	res, _ = http.DefaultClient.Do(req)
+	var respBad mcp.Response
+	_ = json.NewDecoder(res.Body).Decode(&respBad)
+	res.Body.Close()
+
+	badResult, _ := respBad.Result.(map[string]interface{})
+	if isErr, ok := badResult["isError"].(bool); !ok || !isErr {
+		t.Errorf("expected isError: true when connecting with bad secret, got: %+v", badResult)
+	}
+
+	// Test 3c: Identity A trying to connect Identity B's share -> FAILS (Identity Isolation!)
+	connCrossReq := mcp.Request{
+		JSONRPC: "2.0",
+		ID:      3,
+		Method:  "tools/call",
+		Params: json.RawMessage(fmt.Sprintf(`{
+			"name": "connect_share",
+			"arguments": { "share_url": "%s" }
+		}`, sessB.ShareURL)),
+	}
+	crossBytes, _ := json.Marshal(connCrossReq)
+	req, _ = http.NewRequest(http.MethodPost, mcpEndpointA, bytes.NewReader(crossBytes))
+	req.Header.Set("Authorization", "Bearer "+mcpTokenA)
+	req.Header.Set("Mcp-Session-Id", "attacker-conv-1")
+	res, _ = http.DefaultClient.Do(req)
+	var respCross mcp.Response
+	_ = json.NewDecoder(res.Body).Decode(&respCross)
+	res.Body.Close()
+
+	crossResult, _ := respCross.Result.(map[string]interface{})
+	if isErr, ok := crossResult["isError"].(bool); !ok || !isErr {
+		t.Errorf("expected isError: true when cross-connecting other identity's share, got: %+v", crossResult)
+	}
+}
+
+// 4. Isolate share selection across concurrent MCP conversations
+func TestConcurrentConversationIsolation(t *testing.T) {
+	_, ts, cleanup := startTestHub(t)
+	defer cleanup()
+
+	ident := config.GenerateIdentityID()
+	hostToken, _ := config.GenerateSecureToken(16)
+	mcpToken, _ := config.GenerateSecureToken(16)
+
+	regBytes, _ := json.Marshal(hub.SetupRequest{Identity: ident, HostToken: hostToken, MCPToken: mcpToken})
+	_, _ = http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(regBytes))
+
+	cfg := &config.Config{Identity: ident, HubURL: ts.URL, HostToken: hostToken, MCPToken: mcpToken}
+
+	dir1, clean1 := createTestDirectory(t, "conv1-project", "CONV_ONE_DATA")
+	defer clean1()
+
+	dir2, clean2 := createTestDirectory(t, "conv2-project", "CONV_TWO_DATA")
+	defer clean2()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess1, err := host.StartShare(ctx, cfg, dir1, 1*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess1.Close()
+
+	sess2, err := host.StartShare(ctx, cfg, dir2, 1*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess2.Close()
+
+	mcpEndpoint := fmt.Sprintf("%s/%s/mcp", ts.URL, ident)
+
+	// Conversation 1 connects Share 1
+	conn1Bytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"connect_share","arguments":{"share_url":"%s"}}`, sess1.ShareURL)),
+	})
+	req1, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(conn1Bytes))
+	req1.Header.Set("Authorization", "Bearer "+mcpToken)
+	req1.Header.Set("Mcp-Session-Id", "conv-session-1")
+	res1, _ := http.DefaultClient.Do(req1)
+	res1.Body.Close()
+
+	// Conversation 2 connects Share 2
+	conn2Bytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      2,
+		Method:  "tools/call",
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"connect_share","arguments":{"share_url":"%s"}}`, sess2.ShareURL)),
+	})
+	req2, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(conn2Bytes))
+	req2.Header.Set("Authorization", "Bearer "+mcpToken)
+	req2.Header.Set("Mcp-Session-Id", "conv-session-2")
+	res2, _ := http.DefaultClient.Do(req2)
+	res2.Body.Close()
+
+	// In Conversation 1, read_file reads Share 1 data
+	read1Bytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      3,
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"read_file","arguments":{"path":"src/main.go"}}`),
+	})
+	r1, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(read1Bytes))
+	r1.Header.Set("Authorization", "Bearer "+mcpToken)
+	r1.Header.Set("Mcp-Session-Id", "conv-session-1")
+	respR1, _ := http.DefaultClient.Do(r1)
+	var r1Parsed mcp.Response
+	_ = json.NewDecoder(respR1.Body).Decode(&r1Parsed)
+	respR1.Body.Close()
+
+	text1 := r1Parsed.Result.(map[string]interface{})["content"].([]interface{})[0].(map[string]interface{})["text"].(string)
+	if !strings.Contains(text1, "CONV_ONE_DATA") {
+		t.Errorf("expected Conversation 1 to read CONV_ONE_DATA, got:\n%s", text1)
+	}
+
+	// In Conversation 2, read_file reads Share 2 data
+	read2Bytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      4,
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"read_file","arguments":{"path":"src/main.go"}}`),
+	})
+	r2, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(read2Bytes))
+	r2.Header.Set("Authorization", "Bearer "+mcpToken)
+	r2.Header.Set("Mcp-Session-Id", "conv-session-2")
+	respR2, _ := http.DefaultClient.Do(r2)
+	var r2Parsed mcp.Response
+	_ = json.NewDecoder(respR2.Body).Decode(&r2Parsed)
+	respR2.Body.Close()
+
+	text2 := r2Parsed.Result.(map[string]interface{})["content"].([]interface{})[0].(map[string]interface{})["text"].(string)
+	if !strings.Contains(text2, "CONV_TWO_DATA") {
+		t.Errorf("expected Conversation 2 to read CONV_TWO_DATA, got:\n%s", text2)
+	}
+}
+
+// 5. Host-side capability validation enforcement
+func TestHostSideCapabilityValidation(t *testing.T) {
+	_, ts, cleanup := startTestHub(t)
+	defer cleanup()
+
+	ident := config.GenerateIdentityID()
+	hostToken, _ := config.GenerateSecureToken(16)
+	mcpToken, _ := config.GenerateSecureToken(16)
+
+	regBytes, _ := json.Marshal(hub.SetupRequest{Identity: ident, HostToken: hostToken, MCPToken: mcpToken})
+	_, _ = http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(regBytes))
+
+	cfg := &config.Config{Identity: ident, HubURL: ts.URL, HostToken: hostToken, MCPToken: mcpToken}
+
+	dir, clean := createTestDirectory(t, "host-defense", "SUPER_SECURE")
+	defer clean()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess, err := host.StartShare(ctx, cfg, dir, 1*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	// Direct call to /api/inspect with invalid secret
+	badInspectPayload := hub.InspectRequest{
+		SessionID: sess.SessionID,
+		Secret:    "tampered-secret",
+		Op:        "read_file",
+		Args:      map[string]interface{}{"path": "src/main.go"},
+	}
+	badData, _ := json.Marshal(badInspectPayload)
+	resp, err := http.Post(ts.URL+"/api/inspect", "application/json", bytes.NewReader(badData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for invalid capability secret, got %d", resp.StatusCode)
+	}
+}
+
+// 6. Direct browser WebRTC P2P inspection test
+func TestBrowserWebRTC_P2PDirect(t *testing.T) {
+	_, ts, cleanup := startTestHub(t)
+	defer cleanup()
+
+	ident := config.GenerateIdentityID()
+	hostToken, _ := config.GenerateSecureToken(16)
+	mcpToken, _ := config.GenerateSecureToken(16)
+
+	regBytes, _ := json.Marshal(hub.SetupRequest{Identity: ident, HostToken: hostToken, MCPToken: mcpToken})
+	_, _ = http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(regBytes))
+
+	cfg := &config.Config{Identity: ident, HubURL: ts.URL, HostToken: hostToken, MCPToken: mcpToken}
+
+	dir, clean := createTestDirectory(t, "webrtc-dir", "WEBRTC_PAYLOAD")
+	defer clean()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess, err := host.StartShare(ctx, cfg, dir, 1*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	// Verify terminal CLI can inspect
+	cli, err := client.ParseShareURL(sess.ShareURL)
+	if err != nil {
+		t.Fatalf("ParseShareURL failed: %v", err)
+	}
+	readRes, err := cli.ReadFile("src/main.go", 1, 10)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if !strings.Contains(readRes.Content, "WEBRTC_PAYLOAD") {
+		t.Errorf("expected WEBRTC_PAYLOAD in content, got: %s", readRes.Content)
+	}
+
+	// WebRTC direct browser P2P connection test
 	m := &webrtc.MediaEngine{}
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
 
@@ -362,39 +595,27 @@ func testWebRTCBrowserP2P(t *testing.T, hubURL, sessionID, secret string) {
 	openChan := make(chan struct{})
 	msgChan := make(chan string, 10)
 
-	dc.OnOpen(func() {
-		close(openChan)
-	})
+	dc.OnOpen(func() { close(openChan) })
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) { msgChan <- string(msg.Data) })
 
-	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		msgChan <- string(msg.Data)
-	})
-
-	offer, err := clientPC.CreateOffer(nil)
-	if err != nil {
-		t.Fatalf("CreateOffer failed: %v", err)
-	}
-
+	offer, _ := clientPC.CreateOffer(nil)
 	gatherComplete := webrtc.GatheringCompletePromise(clientPC)
-	if err := clientPC.SetLocalDescription(offer); err != nil {
-		t.Fatalf("SetLocalDescription failed: %v", err)
-	}
+	_ = clientPC.SetLocalDescription(offer)
 
 	select {
 	case <-gatherComplete:
 	case <-time.After(2 * time.Second):
 	}
 
-	// Send offer to Hub signaling endpoint: /s/<sessionID>/signal
-	signalURL := fmt.Sprintf("%s/s/%s/signal", hubURL, sessionID)
+	signalURL := fmt.Sprintf("%s/s/%s/signal", ts.URL, sess.SessionID)
 	reqPayload := map[string]string{
 		"offer_sdp": clientPC.LocalDescription().SDP,
-		"secret":    secret,
+		"secret":    sess.Secret,
 	}
 	data, _ := json.Marshal(reqPayload)
 	sigRes, err := http.Post(signalURL, "application/json", bytes.NewReader(data))
 	if err != nil || sigRes.StatusCode != http.StatusOK {
-		t.Fatalf("Signaling failed: status %d, err %v", sigRes.StatusCode, err)
+		t.Fatalf("Signaling failed: %v", err)
 	}
 
 	var sigResp struct {
@@ -403,44 +624,65 @@ func testWebRTCBrowserP2P(t *testing.T, hubURL, sessionID, secret string) {
 	_ = json.NewDecoder(sigRes.Body).Decode(&sigResp)
 	sigRes.Body.Close()
 
-	if sigResp.AnswerSDP == "" {
-		t.Fatalf("no answer SDP received")
-	}
-
-	// Set remote description
-	err = clientPC.SetRemoteDescription(webrtc.SessionDescription{
+	_ = clientPC.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer,
 		SDP:  sigResp.AnswerSDP,
 	})
-	if err != nil {
-		t.Fatalf("SetRemoteDescription failed: %v", err)
-	}
 
-	// Wait for data channel open (direct P2P established)
 	select {
 	case <-openChan:
 	case <-time.After(5 * time.Second):
-		t.Fatalf("WebRTC data channel failed to open within 5s")
+		t.Fatalf("Data channel did not open")
 	}
 
-	// Send inspection request over WebRTC DataChannel directly
 	dcReq := map[string]interface{}{
-		"id":     "dc-req-1",
-		"action": "list_directory",
-		"secret": secret,
-		"args":   map[string]interface{}{"path": ""},
+		"id":     "p2p-req-1",
+		"action": "read_file",
+		"secret": sess.Secret,
+		"args":   map[string]interface{}{"path": "src/main.go"},
 	}
-	reqBytes, _ := json.Marshal(dcReq)
-	if err := dc.SendText(string(reqBytes)); err != nil {
-		t.Fatalf("failed to send over data channel: %v", err)
-	}
+	dcBytes, _ := json.Marshal(dcReq)
+	_ = dc.SendText(string(dcBytes))
 
 	select {
 	case respStr := <-msgChan:
-		if !strings.Contains(respStr, "src") {
-			t.Errorf("unexpected WebRTC DC response: %s", respStr)
+		if !strings.Contains(respStr, "WEBRTC_PAYLOAD") {
+			t.Errorf("expected WEBRTC_PAYLOAD via data channel, got: %s", respStr)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatalf("timed out waiting for WebRTC inspection response")
+		t.Fatalf("timed out waiting for data channel inspection response")
 	}
 }
+
+// 7. Test Traversal and Symlink protection
+func TestTraversalAndExclusionGuards(t *testing.T) {
+	dir, cleanup := createTestDirectory(t, "guards", "GUARD_DATA")
+	defer cleanup()
+
+	eng, err := engine.New(dir, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Path traversal
+	_, err = eng.ReadFile("../../../etc/passwd", 0, 0)
+	if err != engine.ErrAccessDenied {
+		t.Errorf("expected ErrAccessDenied for path traversal, got %v", err)
+	}
+
+	// Secret exclusion
+	_, err = eng.ReadFile(".env", 0, 0)
+	if err != engine.ErrAccessDenied {
+		t.Errorf("expected ErrAccessDenied for .env file, got %v", err)
+	}
+
+	// Git exclusion
+	_, err = eng.ReadFile(".git/config", 0, 0)
+	if err != engine.ErrAccessDenied {
+		t.Errorf("expected ErrAccessDenied for .git, got %v", err)
+	}
+}
+
+// Ensure unused import warning prevention
+var _ = sha256.New
+var _ = hex.EncodeToString

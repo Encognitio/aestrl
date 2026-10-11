@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,17 +10,17 @@ import (
 	"strings"
 )
 
-// Executor defines the operations needed by MCP tools.
+// Executor defines the operations needed by MCP tools with session isolation.
 type Executor interface {
-	ConnectShare(shareURL string) (interface{}, error)
-	ListShares() (interface{}, error)
-	ListDirectory(shareID, path string) (interface{}, error)
-	Tree(shareID, path string, depth int) (interface{}, error)
-	SearchFiles(shareID, query, path string) (interface{}, error)
-	SearchContent(shareID, query, path string, isRegex bool) (interface{}, error)
-	ReadFile(shareID, path string, startLine, endLine int) (interface{}, error)
-	FileInfo(shareID, path string) (interface{}, error)
-	GetFile(shareID, path string) (interface{}, error)
+	ConnectShare(sessionID, shareURL string) (interface{}, error)
+	ListShares(sessionID string) (interface{}, error)
+	ListDirectory(sessionID, shareID, path string) (interface{}, error)
+	Tree(sessionID, shareID, path string, depth int) (interface{}, error)
+	SearchFiles(sessionID, shareID, query, path string) (interface{}, error)
+	SearchContent(sessionID, shareID, query, path string, isRegex bool) (interface{}, error)
+	ReadFile(sessionID, shareID, path string, startLine, endLine int) (interface{}, error)
+	FileInfo(sessionID, shareID, path string) (interface{}, error)
+	GetFile(sessionID, shareID, path string) (interface{}, error)
 }
 
 // Handler handles Streamable HTTP and SSE MCP requests.
@@ -35,33 +37,58 @@ func NewHandler(expectedToken string, executor Executor) *Handler {
 	}
 }
 
-// ServeHTTP implements the HTTP transport for MCP (Streamable HTTP / SSE).
+// ServeHTTP implements the HTTP transport for MCP (Streamable HTTP / SSE) with OpenAI/ChatGPT auth.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Enable CORS for web-based MCP clients (ChatGPT web, etc.)
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Mcp-Session-Id, X-Conversation-Id, X-Api-Key")
+	w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id")
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// Authenticate Bearer token if token is configured
+	// Authenticate token if expectedToken is configured
 	if h.expectedToken != "" {
-		authHeader := r.Header.Get("Authorization")
 		token := ""
+		authHeader := r.Header.Get("Authorization")
 		if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
 			token = strings.TrimSpace(authHeader[7:])
+		} else if apiKey := r.Header.Get("X-Api-Key"); apiKey != "" {
+			token = strings.TrimSpace(apiKey)
 		} else if qToken := r.URL.Query().Get("token"); qToken != "" {
-			token = qToken
+			token = strings.TrimSpace(qToken)
 		}
 
 		if token != h.expectedToken {
+			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="Invalid or missing MCP bearer token"`)
 			writeRPCError(w, nil, CodeUnauthorized, "Unauthorized: invalid or missing MCP token", http.StatusUnauthorized)
 			return
 		}
 	}
+
+	// Extract or generate MCP Session ID for conversation-level isolation
+	sessionID := r.Header.Get("Mcp-Session-Id")
+	if sessionID == "" {
+		sessionID = r.URL.Query().Get("sessionId")
+	}
+	if sessionID == "" {
+		if convID := r.Header.Get("X-Conversation-Id"); convID != "" {
+			sessionID = convID
+		} else if clientID := r.Header.Get("X-Client-Id"); clientID != "" {
+			sessionID = clientID
+		}
+	}
+	if sessionID == "" {
+		// Generate random session ID or derive from caller IP
+		b := make([]byte, 8)
+		_, _ = rand.Read(b)
+		sessionID = "sess-" + hex.EncodeToString(b)
+	}
+
+	w.Header().Set("Mcp-Session-Id", sessionID)
 
 	switch r.Method {
 	case http.MethodPost:
@@ -77,7 +104,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		resp := h.handleRequest(&req)
+		resp := h.handleRequest(sessionID, &req)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 
@@ -88,12 +115,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Simple status check
+		// Status and discovery metadata
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "ok",
-			"service": "aestrl-mcp",
-			"version": "1.0.0",
+			"status":      "ok",
+			"service":     "aestrl-mcp",
+			"version":     "1.0.0",
+			"auth_method": "bearer",
+			"session_id":  sessionID,
 		})
 
 	default:
@@ -101,7 +130,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Handler) handleRequest(req *Request) *Response {
+func (h *Handler) handleRequest(sessionID string, req *Request) *Response {
 	resp := &Response{
 		JSONRPC: "2.0",
 		ID:      req.ID,
@@ -153,7 +182,7 @@ func (h *Handler) handleRequest(req *Request) *Response {
 			return resp
 		}
 
-		toolResult := h.executeTool(callParams.Name, callParams.Arguments)
+		toolResult := h.executeTool(sessionID, callParams.Name, callParams.Arguments)
 		resp.Result = toolResult
 
 	default:
@@ -166,7 +195,7 @@ func (h *Handler) handleRequest(req *Request) *Response {
 	return resp
 }
 
-func (h *Handler) executeTool(name string, args map[string]interface{}) CallToolResult {
+func (h *Handler) executeTool(sessionID, name string, args map[string]interface{}) CallToolResult {
 	if h.executor == nil {
 		return formatError(fmt.Errorf("no executor attached"))
 	}
@@ -179,14 +208,14 @@ func (h *Handler) executeTool(name string, args map[string]interface{}) CallTool
 		if url == "" {
 			return formatError(fmt.Errorf("missing required 'share_url' argument"))
 		}
-		res, err := h.executor.ConnectShare(url)
+		res, err := h.executor.ConnectShare(sessionID, url)
 		if err != nil {
 			return formatError(err)
 		}
 		return formatSuccess(res)
 
 	case "list_shares":
-		res, err := h.executor.ListShares()
+		res, err := h.executor.ListShares(sessionID)
 		if err != nil {
 			return formatError(err)
 		}
@@ -194,7 +223,7 @@ func (h *Handler) executeTool(name string, args map[string]interface{}) CallTool
 
 	case "list_directory":
 		path := getString(args, "path")
-		res, err := h.executor.ListDirectory(shareID, path)
+		res, err := h.executor.ListDirectory(sessionID, shareID, path)
 		if err != nil {
 			return formatError(err)
 		}
@@ -203,7 +232,7 @@ func (h *Handler) executeTool(name string, args map[string]interface{}) CallTool
 	case "tree":
 		path := getString(args, "path")
 		depth := getInt(args, "depth", 3)
-		res, err := h.executor.Tree(shareID, path, depth)
+		res, err := h.executor.Tree(sessionID, shareID, path, depth)
 		if err != nil {
 			return formatError(err)
 		}
@@ -215,7 +244,7 @@ func (h *Handler) executeTool(name string, args map[string]interface{}) CallTool
 			return formatError(fmt.Errorf("missing required 'query' argument"))
 		}
 		path := getString(args, "path")
-		res, err := h.executor.SearchFiles(shareID, query, path)
+		res, err := h.executor.SearchFiles(sessionID, shareID, query, path)
 		if err != nil {
 			return formatError(err)
 		}
@@ -228,7 +257,7 @@ func (h *Handler) executeTool(name string, args map[string]interface{}) CallTool
 		}
 		path := getString(args, "path")
 		isRegex := getBool(args, "is_regex", false)
-		res, err := h.executor.SearchContent(shareID, query, path, isRegex)
+		res, err := h.executor.SearchContent(sessionID, shareID, query, path, isRegex)
 		if err != nil {
 			return formatError(err)
 		}
@@ -241,7 +270,7 @@ func (h *Handler) executeTool(name string, args map[string]interface{}) CallTool
 		}
 		startLine := getInt(args, "start_line", 0)
 		endLine := getInt(args, "end_line", 0)
-		res, err := h.executor.ReadFile(shareID, path, startLine, endLine)
+		res, err := h.executor.ReadFile(sessionID, shareID, path, startLine, endLine)
 		if err != nil {
 			return formatError(err)
 		}
@@ -252,7 +281,7 @@ func (h *Handler) executeTool(name string, args map[string]interface{}) CallTool
 		if path == "" {
 			return formatError(fmt.Errorf("missing required 'path' argument"))
 		}
-		res, err := h.executor.FileInfo(shareID, path)
+		res, err := h.executor.FileInfo(sessionID, shareID, path)
 		if err != nil {
 			return formatError(err)
 		}
@@ -263,7 +292,7 @@ func (h *Handler) executeTool(name string, args map[string]interface{}) CallTool
 		if path == "" {
 			return formatError(fmt.Errorf("missing required 'path' argument"))
 		}
-		res, err := h.executor.GetFile(shareID, path)
+		res, err := h.executor.GetFile(sessionID, shareID, path)
 		if err != nil {
 			return formatError(err)
 		}
