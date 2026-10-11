@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -222,19 +223,20 @@ func TestChatGPTWeb_EndToEndFlow(t *testing.T) {
 		t.Fatalf("connect_share error: %+v", connRPCResp.Error)
 	}
 
-	// Step 3: ChatGPT reads source file via read_file tool
+	// Step 3: ChatGPT reads source file via read_file tool with explicit share_id
 	readReq := mcp.Request{
 		JSONRPC: "2.0",
 		ID:      3,
 		Method:  "tools/call",
-		Params: json.RawMessage(`{
+		Params: json.RawMessage(fmt.Sprintf(`{
 			"name": "read_file",
 			"arguments": {
+				"share_id": "%s",
 				"path": "src/main.go",
 				"start_line": 1,
 				"end_line": 10
 			}
-		}`),
+		}`, sess.SessionID)),
 	}
 	readBytes, _ := json.Marshal(readReq)
 	httpReq, _ = http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(readBytes))
@@ -451,12 +453,12 @@ func TestConcurrentConversationIsolation(t *testing.T) {
 	res2, _ := http.DefaultClient.Do(req2)
 	res2.Body.Close()
 
-	// In Conversation 1, read_file reads Share 1 data
+	// In Conversation 1, read_file reads Share 1 data with explicit share_id
 	read1Bytes, _ := json.Marshal(mcp.Request{
 		JSONRPC: "2.0",
 		ID:      3,
 		Method:  "tools/call",
-		Params:  json.RawMessage(`{"name":"read_file","arguments":{"path":"src/main.go"}}`),
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"read_file","arguments":{"share_id":"%s","path":"src/main.go"}}`, sess1.SessionID)),
 	})
 	r1, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(read1Bytes))
 	r1.Header.Set("Authorization", "Bearer "+mcpToken)
@@ -471,12 +473,12 @@ func TestConcurrentConversationIsolation(t *testing.T) {
 		t.Errorf("expected Conversation 1 to read CONV_ONE_DATA, got:\n%s", text1)
 	}
 
-	// In Conversation 2, read_file reads Share 2 data
+	// In Conversation 2, read_file reads Share 2 data with explicit share_id
 	read2Bytes, _ := json.Marshal(mcp.Request{
 		JSONRPC: "2.0",
 		ID:      4,
 		Method:  "tools/call",
-		Params:  json.RawMessage(`{"name":"read_file","arguments":{"path":"src/main.go"}}`),
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"read_file","arguments":{"share_id":"%s","path":"src/main.go"}}`, sess2.SessionID)),
 	})
 	r2, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(read2Bytes))
 	r2.Header.Set("Authorization", "Bearer "+mcpToken)
@@ -489,6 +491,54 @@ func TestConcurrentConversationIsolation(t *testing.T) {
 	text2 := r2Parsed.Result.(map[string]interface{})["content"].([]interface{})[0].(map[string]interface{})["text"].(string)
 	if !strings.Contains(text2, "CONV_TWO_DATA") {
 		t.Errorf("expected Conversation 2 to read CONV_TWO_DATA, got:\n%s", text2)
+	}
+
+	// Negative Check: Conversation 1 CANNOT read Share 2 data
+	cross1Bytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      5,
+		Method:  "tools/call",
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"read_file","arguments":{"share_id":"%s","path":"src/main.go"}}`, sess2.SessionID)),
+	})
+	rCross1, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(cross1Bytes))
+	rCross1.Header.Set("Authorization", "Bearer "+mcpToken)
+	rCross1.Header.Set("Mcp-Session-Id", "conv-session-1")
+	respCross1, _ := http.DefaultClient.Do(rCross1)
+	var cross1Parsed mcp.Response
+	_ = json.NewDecoder(respCross1.Body).Decode(&cross1Parsed)
+	respCross1.Body.Close()
+
+	if cross1Parsed.Result != nil {
+		resMap := cross1Parsed.Result.(map[string]interface{})
+		if isErr, ok := resMap["isError"].(bool); !ok || !isErr {
+			t.Errorf("expected isError: true when Conversation 1 attempts reading Share 2, got: %+v", resMap)
+		}
+	} else if cross1Parsed.Error == nil {
+		t.Errorf("expected error when Conversation 1 attempts reading Share 2, got success")
+	}
+
+	// Negative Check: Conversation 2 CANNOT read Share 1 data
+	cross2Bytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      6,
+		Method:  "tools/call",
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"read_file","arguments":{"share_id":"%s","path":"src/main.go"}}`, sess1.SessionID)),
+	})
+	rCross2, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(cross2Bytes))
+	rCross2.Header.Set("Authorization", "Bearer "+mcpToken)
+	rCross2.Header.Set("Mcp-Session-Id", "conv-session-2")
+	respCross2, _ := http.DefaultClient.Do(rCross2)
+	var cross2Parsed mcp.Response
+	_ = json.NewDecoder(respCross2.Body).Decode(&cross2Parsed)
+	respCross2.Body.Close()
+
+	if cross2Parsed.Result != nil {
+		resMap := cross2Parsed.Result.(map[string]interface{})
+		if isErr, ok := resMap["isError"].(bool); !ok || !isErr {
+			t.Errorf("expected isError: true when Conversation 2 attempts reading Share 1, got: %+v", resMap)
+		}
+	} else if cross2Parsed.Error == nil {
+		t.Errorf("expected error when Conversation 2 attempts reading Share 1, got success")
 	}
 }
 
@@ -734,7 +784,27 @@ func TestOAuth21_Flow(t *testing.T) {
 		t.Errorf("missing endpoints in auth server metadata: %+v", asMap)
 	}
 
-	// Step 8c: Initiate OAuth Authorization Code Flow with PKCE (S256)
+	// Step 8c: Dynamic Client Registration (RFC 7591)
+	regURL := fmt.Sprintf("%s/%s/oauth/register", ts.URL, ident)
+	redirectTarget := "https://chatgpt.com/api/aip/plugin-oauth/callback"
+	regBody, _ := json.Marshal(map[string]interface{}{
+		"client_name":   "ChatGPT Plugin",
+		"redirect_uris": []string{redirectTarget},
+	})
+	regRes, err := http.Post(regURL, "application/json", bytes.NewReader(regBody))
+	if err != nil || regRes.StatusCode != http.StatusCreated {
+		t.Fatalf("dynamic client registration failed: status %d, err %v", regRes.StatusCode, err)
+	}
+	var regData struct {
+		ClientID string `json:"client_id"`
+	}
+	_ = json.NewDecoder(regRes.Body).Decode(&regData)
+	regRes.Body.Close()
+	if regData.ClientID == "" {
+		t.Fatalf("empty client_id returned from DCR")
+	}
+
+	// Step 8d: Initiate OAuth Authorization Code Flow with PKCE (S256)
 	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
 	h := sha256.Sum256([]byte(codeVerifier))
 	codeChallenge := base64.RawURLEncoding.EncodeToString(h[:])
@@ -745,21 +815,44 @@ func TestOAuth21_Flow(t *testing.T) {
 		},
 	}
 
-	redirectTarget := "https://chatgpt.com/api/aip/plugin-oauth/callback"
-	authURL := fmt.Sprintf("%s/%s/oauth/authorize?response_type=code&client_id=chatgpt-client&redirect_uri=%s&state=state123&code_challenge=%s&code_challenge_method=S256",
-		ts.URL, ident, url.QueryEscape(redirectTarget), codeChallenge)
+	authEndpoint := fmt.Sprintf("%s/%s/oauth/authorize", ts.URL, ident)
+	authQuery := fmt.Sprintf("?response_type=code&client_id=%s&redirect_uri=%s&state=state123&code_challenge=%s&code_challenge_method=S256",
+		regData.ClientID, url.QueryEscape(redirectTarget), codeChallenge)
 
-	authResp, err := client.Get(authURL)
+	// Step 8e: Unauthenticated GET must show consent form (200 OK), NOT auto-approve
+	getResp, err := client.Get(authEndpoint + authQuery)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer authResp.Body.Close()
-
-	if authResp.StatusCode != http.StatusFound {
-		t.Fatalf("expected 302 Found redirect, got %d", authResp.StatusCode)
+	defer getResp.Body.Close()
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK consent form for unauthenticated GET, got %d", getResp.StatusCode)
+	}
+	bodyBytes, _ := io.ReadAll(getResp.Body)
+	if !strings.Contains(string(bodyBytes), "Authorize MCP Client") {
+		t.Fatalf("expected consent form HTML, got:\n%s", string(bodyBytes))
 	}
 
-	loc := authResp.Header.Get("Location")
+	// Step 8f: Identity owner approves with their persistent credentials from setup (mcpToken)
+	approveForm := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {regData.ClientID},
+		"redirect_uri":          {redirectTarget},
+		"state":                 {"state123"},
+		"code_challenge":        {codeChallenge},
+		"code_challenge_method": {"S256"},
+		"identity_token":        {mcpToken},
+		"action":                {"approve"},
+	}
+	postResp, err := client.PostForm(authEndpoint, approveForm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer postResp.Body.Close()
+	if postResp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 Found redirect after approval, got %d", postResp.StatusCode)
+	}
+	loc := postResp.Header.Get("Location")
 	parsedLoc, err := url.Parse(loc)
 	if err != nil {
 		t.Fatalf("failed to parse redirect Location: %v", err)
@@ -769,14 +862,14 @@ func TestOAuth21_Flow(t *testing.T) {
 		t.Fatalf("no authorization code returned in redirect: %s", loc)
 	}
 
-	// Step 8d: Exchange Code for Access Token at token endpoint
+	// Step 8g: Exchange Code for Access Token at token endpoint with PKCE verifier
 	tokenEndpoint := fmt.Sprintf("%s/%s/oauth/token", ts.URL, ident)
 	tokenForm := url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {authCode},
 		"code_verifier": {codeVerifier},
 		"redirect_uri":  {redirectTarget},
-		"client_id":     {"chatgpt-client"},
+		"client_id":     {regData.ClientID},
 	}
 	tokenRes, err := http.PostForm(tokenEndpoint, tokenForm)
 	if err != nil || tokenRes.StatusCode != http.StatusOK {
@@ -793,7 +886,7 @@ func TestOAuth21_Flow(t *testing.T) {
 		t.Fatalf("invalid token response: %+v", tokenData)
 	}
 
-	// Step 8e: Use newly issued OAuth access token to query /<ident>/mcp
+	// Step 8h: Use newly issued OAuth access token to query /<ident>/mcp
 	mcpEndpoint := fmt.Sprintf("%s/%s/mcp", ts.URL, ident)
 
 	// Connect share using OAuth token
@@ -818,7 +911,7 @@ func TestOAuth21_Flow(t *testing.T) {
 		t.Fatalf("connect_share error: %+v", cRPC.Error)
 	}
 
-	// Read file using OAuth token
+	// Read file using OAuth token with explicit share_id
 	readReq := mcp.Request{
 		JSONRPC: "2.0",
 		ID:      2,
@@ -844,7 +937,7 @@ func TestOAuth21_Flow(t *testing.T) {
 		t.Fatalf("expected OAUTH_PROTECTED_DATA, got:\n%s", text)
 	}
 
-	// Step 8f: Unauthorized token rejected with 401 and resource_metadata challenge
+	// Step 8i: Unauthorized token rejected with 401 and resource_metadata challenge
 	reqBad, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(readBytes))
 	reqBad.Header.Set("Authorization", "Bearer invalid-oauth-token")
 	badRes, err := http.DefaultClient.Do(reqBad)
@@ -861,6 +954,274 @@ func TestOAuth21_Flow(t *testing.T) {
 	}
 }
 
-// Ensure unused import warning prevention
-var _ = sha256.New
+// 9. Negative tests proving unauthorized OAuth requests are rejected
+func TestOAuth_StrictValidationAndNegativeCases(t *testing.T) {
+	_, ts, cleanup := startTestHub(t)
+	defer cleanup()
+
+	ident := config.GenerateIdentityID()
+	hostToken, _ := config.GenerateSecureToken(16)
+	mcpToken, _ := config.GenerateSecureToken(16)
+
+	regBytes, _ := json.Marshal(hub.SetupRequest{Identity: ident, HostToken: hostToken, MCPToken: mcpToken})
+	_, _ = http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(regBytes))
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	authEndpoint := fmt.Sprintf("%s/%s/oauth/authorize", ts.URL, ident)
+	tokenEndpoint := fmt.Sprintf("%s/%s/oauth/token", ts.URL, ident)
+
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	h := sha256.Sum256([]byte(codeVerifier))
+	codeChallenge := base64.RawURLEncoding.EncodeToString(h[:])
+
+	// Case 1: Untrusted / unregistered client_id -> 400 Bad Request
+	res1, _ := client.Get(authEndpoint + "?client_id=evil-client&redirect_uri=https://evil.com/callback&response_type=code&code_challenge=" + codeChallenge + "&code_challenge_method=S256")
+	if res1.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for untrusted client_id, got %d", res1.StatusCode)
+	}
+	res1.Body.Close()
+
+	// Case 2: Untrusted redirect URI for predefined client (chatgpt client targeting attacker domain) -> 400
+	res2, _ := client.Get(authEndpoint + "?client_id=chatgpt&redirect_uri=https://attacker.org/callback&response_type=code&code_challenge=" + codeChallenge + "&code_challenge_method=S256")
+	if res2.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for untrusted redirect URI, got %d", res2.StatusCode)
+	}
+	res2.Body.Close()
+
+	// Case 3: Redirect URI containing fragment -> 400
+	res3, _ := client.Get(authEndpoint + "?client_id=chatgpt&redirect_uri=https://chatgpt.com/callback#fragment&response_type=code&code_challenge=" + codeChallenge + "&code_challenge_method=S256")
+	if res3.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for redirect URI with fragment, got %d", res3.StatusCode)
+	}
+	res3.Body.Close()
+
+	// Case 4: Missing code_challenge -> 400
+	res4, _ := client.Get(authEndpoint + "?client_id=chatgpt&redirect_uri=https://chatgpt.com/callback&response_type=code&code_challenge_method=S256")
+	if res4.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing code_challenge, got %d", res4.StatusCode)
+	}
+	res4.Body.Close()
+
+	// Case 5: Plain PKCE method (forbidden in OAuth 2.1) -> 400
+	res5, _ := client.Get(authEndpoint + "?client_id=chatgpt&redirect_uri=https://chatgpt.com/callback&response_type=code&code_challenge=" + codeChallenge + "&code_challenge_method=plain")
+	if res5.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for plain PKCE, got %d", res5.StatusCode)
+	}
+	res5.Body.Close()
+
+	// Case 6: Invalid resource audience -> 400
+	res6, _ := client.Get(authEndpoint + "?client_id=chatgpt&redirect_uri=https://chatgpt.com/callback&response_type=code&code_challenge=" + codeChallenge + "&code_challenge_method=S256&resource=https://other-domain/mcp")
+	if res6.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for mismatched resource audience, got %d", res6.StatusCode)
+	}
+	res6.Body.Close()
+
+	// Case 7: Invalid scope -> 400
+	res7, _ := client.Get(authEndpoint + "?client_id=chatgpt&redirect_uri=https://chatgpt.com/callback&response_type=code&code_challenge=" + codeChallenge + "&code_challenge_method=S256&scope=admin_super")
+	if res7.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid scope, got %d", res7.StatusCode)
+	}
+	res7.Body.Close()
+
+	// Case 8: POST authorization with invalid identity credentials -> 401 Unauthorized
+	postFormBad := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"chatgpt"},
+		"redirect_uri":          {"https://chatgpt.com/callback"},
+		"code_challenge":        {codeChallenge},
+		"code_challenge_method": {"S256"},
+		"identity_token":        {"wrong-identity-token"},
+		"action":                {"approve"},
+	}
+	res8, _ := client.PostForm(authEndpoint, postFormBad)
+	if res8.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for invalid identity credentials, got %d", res8.StatusCode)
+	}
+	res8.Body.Close()
+
+	// Case 9: Identity owner explicitly denies authorization -> 302 redirect with error=access_denied
+	postFormDeny := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"chatgpt"},
+		"redirect_uri":          {"https://chatgpt.com/callback"},
+		"state":                 {"state-deny"},
+		"code_challenge":        {codeChallenge},
+		"code_challenge_method": {"S256"},
+		"identity_token":        {mcpToken},
+		"action":                {"deny"},
+	}
+	res9, _ := client.PostForm(authEndpoint, postFormDeny)
+	if res9.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302 Found redirect for deny, got %d", res9.StatusCode)
+	}
+	denyLoc, _ := url.Parse(res9.Header.Get("Location"))
+	if denyLoc.Query().Get("error") != "access_denied" {
+		t.Errorf("expected error=access_denied, got: %s", denyLoc.Query().Get("error"))
+	}
+	res9.Body.Close()
+
+	// Case 10: Valid authorization followed by invalid PKCE verifier at token endpoint -> 400 invalid_grant
+	postFormOK := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"chatgpt"},
+		"redirect_uri":          {"https://chatgpt.com/callback"},
+		"code_challenge":        {codeChallenge},
+		"code_challenge_method": {"S256"},
+		"identity_token":        {mcpToken},
+		"action":                {"approve"},
+	}
+	res10, _ := client.PostForm(authEndpoint, postFormOK)
+	locOK, _ := url.Parse(res10.Header.Get("Location"))
+	res10.Body.Close()
+	validCode := locOK.Query().Get("code")
+
+	// Exchange with wrong verifier
+	badTokenForm := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {validCode},
+		"code_verifier": {"wrong-code-verifier-that-fails-s256"},
+		"redirect_uri":  {"https://chatgpt.com/callback"},
+		"client_id":     {"chatgpt"},
+	}
+	resTokenBad, _ := http.PostForm(tokenEndpoint, badTokenForm)
+	if resTokenBad.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for bad code_verifier, got %d", resTokenBad.StatusCode)
+	}
+	resTokenBad.Body.Close()
+
+	// Reusing the same code must fail (single-use)
+	resTokenReuse, _ := http.PostForm(tokenEndpoint, url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {validCode},
+		"code_verifier": {codeVerifier},
+		"redirect_uri":  {"https://chatgpt.com/callback"},
+		"client_id":     {"chatgpt"},
+	})
+	if resTokenReuse.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for reused code, got %d", resTokenReuse.StatusCode)
+	}
+	resTokenReuse.Body.Close()
+}
+
+// 10. Negative tests proving cross-session file reads and unauthorized shares are strictly rejected
+func TestCrossSession_StrictIsolationAndNegativeCases(t *testing.T) {
+	_, ts, cleanup := startTestHub(t)
+	defer cleanup()
+
+	ident := config.GenerateIdentityID()
+	hostToken, _ := config.GenerateSecureToken(16)
+	mcpToken, _ := config.GenerateSecureToken(16)
+
+	regBytes, _ := json.Marshal(hub.SetupRequest{Identity: ident, HostToken: hostToken, MCPToken: mcpToken})
+	_, _ = http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(regBytes))
+
+	cfg := &config.Config{Identity: ident, HubURL: ts.URL, HostToken: hostToken, MCPToken: mcpToken}
+	dir1, clean1 := createTestDirectory(t, "sess-a-dir", "SECRET_A_PAYLOAD")
+	defer clean1()
+	dir2, clean2 := createTestDirectory(t, "sess-b-dir", "SECRET_B_PAYLOAD")
+	defer clean2()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	share1, err := host.StartShare(ctx, cfg, dir1, 1*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer share1.Close()
+
+	share2, err := host.StartShare(ctx, cfg, dir2, 1*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer share2.Close()
+
+	mcpEndpoint := fmt.Sprintf("%s/%s/mcp", ts.URL, ident)
+
+	// Session Alpha authorizes Share 1
+	connABool, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"connect_share","arguments":{"share_url":"%s"}}`, share1.ShareURL)),
+	})
+	reqA, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(connABool))
+	reqA.Header.Set("Authorization", "Bearer "+mcpToken)
+	reqA.Header.Set("Mcp-Session-Id", "session-alpha")
+	resA, _ := http.DefaultClient.Do(reqA)
+	resA.Body.Close()
+
+	// Session Beta (never called connect_share) attempts to read Share 1 with share_id -> MUST BE REJECTED
+	readBBytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      2,
+		Method:  "tools/call",
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"read_file","arguments":{"share_id":"%s","path":"src/main.go"}}`, share1.SessionID)),
+	})
+	reqB, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(readBBytes))
+	reqB.Header.Set("Authorization", "Bearer "+mcpToken)
+	reqB.Header.Set("Mcp-Session-Id", "session-beta")
+	resB, _ := http.DefaultClient.Do(reqB)
+	var respB mcp.Response
+	_ = json.NewDecoder(resB.Body).Decode(&respB)
+	resB.Body.Close()
+
+	if respB.Result != nil {
+		resMap := respB.Result.(map[string]interface{})
+		if isErr, ok := resMap["isError"].(bool); !ok || !isErr {
+			t.Errorf("expected isError: true when session-beta reads share without authorizing, got: %+v", resMap)
+		}
+	} else if respB.Error == nil {
+		t.Errorf("expected error when session-beta reads unauthorized share, got success")
+	}
+
+	// Session Beta attempts list_shares -> Share 1 must NOT be in the list
+	listBBytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      3,
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"list_shares","arguments":{}}`),
+	})
+	reqListB, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(listBBytes))
+	reqListB.Header.Set("Authorization", "Bearer "+mcpToken)
+	reqListB.Header.Set("Mcp-Session-Id", "session-beta")
+	resListB, _ := http.DefaultClient.Do(reqListB)
+	var respListB mcp.Response
+	_ = json.NewDecoder(resListB.Body).Decode(&respListB)
+	resListB.Body.Close()
+
+	listBText := respListB.Result.(map[string]interface{})["content"].([]interface{})[0].(map[string]interface{})["text"].(string)
+	if strings.Contains(listBText, share1.SessionID) {
+		t.Errorf("expected Share 1 not to appear in session-beta list_shares, got: %s", listBText)
+	}
+
+	// Inspection operation without share_id parameter -> MUST BE REJECTED
+	noShareIDBytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      4,
+		Method:  "tools/call",
+		Params:  json.RawMessage(`{"name":"read_file","arguments":{"path":"src/main.go"}}`),
+	})
+	reqNoID, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(noShareIDBytes))
+	reqNoID.Header.Set("Authorization", "Bearer "+mcpToken)
+	reqNoID.Header.Set("Mcp-Session-Id", "session-alpha")
+	resNoID, _ := http.DefaultClient.Do(reqNoID)
+	var respNoID mcp.Response
+	_ = json.NewDecoder(resNoID.Body).Decode(&respNoID)
+	resNoID.Body.Close()
+
+	if respNoID.Result != nil {
+		resMap := respNoID.Result.(map[string]interface{})
+		if isErr, ok := resMap["isError"].(bool); !ok || !isErr {
+			t.Errorf("expected isError: true for missing share_id, got: %+v", resMap)
+		}
+	} else if respNoID.Error == nil {
+		t.Errorf("expected error for missing share_id, got success")
+	}
+}
+
 var _ = hex.EncodeToString

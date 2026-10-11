@@ -77,15 +77,14 @@ type MCPSession struct {
 // Hub coordinates identities, hosts, MCP gateway, and WebRTC signaling.
 type Hub struct {
 	config                   Config
-	identities               map[string]*IdentityRecord
-	hosts                    map[string][]*HostConnection            // Identity -> []*HostConnection
-	shares                   map[string]*ActiveShare                 // SessionID -> *ActiveShare
-	mcpSessions              map[string]*MCPSession                  // SessionID -> *MCPSession
-	identityAuthorizedShares map[string]map[string]string            // Identity -> ShareID -> Secret
-	oauth                    *OAuthManager
-	mu                       sync.RWMutex
-	upgrader                 websocket.Upgrader
-	webAssets                http.FileSystem
+	identities  map[string]*IdentityRecord
+	hosts       map[string][]*HostConnection // Identity -> []*HostConnection
+	shares      map[string]*ActiveShare      // SessionID -> *ActiveShare
+	mcpSessions map[string]*MCPSession       // SessionID -> *MCPSession
+	oauth       *OAuthManager
+	mu          sync.RWMutex
+	upgrader    websocket.Upgrader
+	webAssets   http.FileSystem
 }
 
 // New creates a new Hub instance.
@@ -98,14 +97,13 @@ func New(cfg Config, webAssets http.FileSystem) (*Hub, error) {
 	}
 
 	h := &Hub{
-		config:                   cfg,
-		identities:               make(map[string]*IdentityRecord),
-		hosts:                    make(map[string][]*HostConnection),
-		shares:                   make(map[string]*ActiveShare),
-		mcpSessions:              make(map[string]*MCPSession),
-		identityAuthorizedShares: make(map[string]map[string]string),
-		oauth:                    NewOAuthManager(),
-		webAssets:                webAssets,
+		config:      cfg,
+		identities:  make(map[string]*IdentityRecord),
+		hosts:       make(map[string][]*HostConnection),
+		shares:      make(map[string]*ActiveShare),
+		mcpSessions: make(map[string]*MCPSession),
+		oauth:       NewOAuthManager(),
+		webAssets:   webAssets,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all origins for WebRTC signaling and MCP
@@ -274,6 +272,10 @@ func (h *Hub) handleRootRouting(w http.ResponseWriter, r *http.Request) {
 				}
 				if parts[2] == "token" {
 					h.HandleOAuthToken(w, r, identity)
+					return
+				}
+				if parts[2] == "register" {
+					h.HandleOAuthRegister(w, r, identity)
 					return
 				}
 			}
@@ -686,11 +688,6 @@ func (e *hubExecutor) resolveShare(mcpSessionID, shareID string) (*ActiveShare, 
 	e.hub.mu.RLock()
 	defer e.hub.mu.RUnlock()
 
-	sess := e.hub.mcpSessions[mcpSessionID]
-	if shareID == "" && sess != nil {
-		shareID = sess.ActiveShareID
-	}
-
 	if shareID == "" {
 		return nil, "", errors.New("missing required 'share_id' parameter. Please call connect_share(share_url) and pass the returned share_id.")
 	}
@@ -705,16 +702,14 @@ func (e *hubExecutor) resolveShare(mcpSessionID, shareID string) (*ActiveShare, 
 		return nil, "", errors.New("share session not found under this identity")
 	}
 
-	// Enforce Capability Validation for this conversation or identity
-	secret := ""
-	if sess != nil {
-		secret = sess.AuthorizedShares[shareID]
+	// Enforce Session-Scoped Capability Validation (strict session isolation)
+	sess := e.hub.mcpSessions[mcpSessionID]
+	if sess == nil {
+		return nil, "", errors.New("unauthorized: MCP session not found; call connect_share(share_url) first")
 	}
-	if secret == "" && e.hub.identityAuthorizedShares[e.identity] != nil {
-		secret = e.hub.identityAuthorizedShares[e.identity][shareID]
-	}
+	secret := sess.AuthorizedShares[shareID]
 	if secret == "" {
-		return nil, "", errors.New("unauthorized: share '" + shareID + "' has not been authorized; call connect_share(share_url) first")
+		return nil, "", errors.New("unauthorized: share '" + shareID + "' has not been authorized in this MCP session; call connect_share(share_url) first")
 	}
 
 	return share, secret, nil
@@ -765,7 +760,7 @@ func (e *hubExecutor) ConnectShare(mcpSessionID, shareURL string) (interface{}, 
 		return nil, ErrShareUnauthorized
 	}
 
-	// Record authorized capability in this conversation's MCP session
+	// Record authorized capability in this specific conversation's MCP session
 	sess, exists := e.hub.mcpSessions[mcpSessionID]
 	if !exists {
 		sess = &MCPSession{
@@ -778,12 +773,6 @@ func (e *hubExecutor) ConnectShare(mcpSessionID, shareURL string) (interface{}, 
 	sess.ActiveShareID = sessionID
 	sess.AuthorizedShares[sessionID] = secret
 	sess.LastSeen = time.Now()
-
-	// Also record in identity-scoped authorized shares for stateless tool calls
-	if e.hub.identityAuthorizedShares[e.identity] == nil {
-		e.hub.identityAuthorizedShares[e.identity] = make(map[string]string)
-	}
-	e.hub.identityAuthorizedShares[e.identity][sessionID] = secret
 
 	return map[string]interface{}{
 		"status":     "connected",
@@ -800,15 +789,13 @@ func (e *hubExecutor) ListShares(mcpSessionID string) (interface{}, error) {
 
 	sess := e.hub.mcpSessions[mcpSessionID]
 	var shares []ShareMeta
+	if sess == nil {
+		return shares, nil
+	}
+
 	for _, s := range e.hub.shares {
 		if s.Identity == e.identity && time.Now().Before(s.ExpiresAt) {
-			isAuth := false
-			if sess != nil && sess.AuthorizedShares[s.SessionID] != "" {
-				isAuth = true
-			} else if e.hub.identityAuthorizedShares[e.identity] != nil && e.hub.identityAuthorizedShares[e.identity][s.SessionID] != "" {
-				isAuth = true
-			}
-			if isAuth {
+			if sess.AuthorizedShares[s.SessionID] != "" {
 				shares = append(shares, ShareMeta{
 					SessionID: s.SessionID,
 					Name:      s.Name,

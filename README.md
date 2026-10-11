@@ -90,10 +90,11 @@ Option A (Bearer / API Key):
   - Token: 3a9f02...
 
 Option B (OAuth 2.1):
-  - Client ID: h7af8ven8
-  - Client Secret: 3a9f02...
+  - Discovery: https://aestrl.dvrsfy.org/h7af8ven8/.well-known/oauth-authorization-server
   - Authorization URL: https://aestrl.dvrsfy.org/h7af8ven8/oauth/authorize
   - Token URL: https://aestrl.dvrsfy.org/h7af8ven8/oauth/token
+  - Dynamic Registration: https://aestrl.dvrsfy.org/h7af8ven8/oauth/register
+  - Consent: Approves via prompt using persistent MCP token
 
 To share a directory, run:
   aestrl share ./project
@@ -104,7 +105,8 @@ To share a directory, run:
 1. Open ChatGPT -> **Settings** -> **Connected Apps** (or Custom Actions / Developer Mode / MCP).
 2. Add a new MCP server:
    - **URL**: `https://aestrl.dvrsfy.org/<identity>/mcp`
-   - **Authentication**: Choose **Bearer Token / API Key** (enter `<mcp_token>`), or **OAuth** (enter the Authorization and Token URLs above).
+   - **Authentication**: Choose **Bearer Token / API Key** (enter `<mcp_token>`), or **OAuth 2.1** (uses RFC 8414 metadata discovery or URLs above).
+   - When authorizing via OAuth in the browser, confirm the identity and enter your persistent MCP token on the consent prompt.
 3. Save. This integration stays configured permanently across restarts, updates, and different projects.
 
 ### Step 3: Share a Directory

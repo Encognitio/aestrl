@@ -22,7 +22,7 @@ import (
 	"github.com/Encognitio/aestrl/web"
 )
 
-const Version = "1.0.0"
+const Version = "1.0.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -237,15 +237,16 @@ Option A (Bearer / API Key):
   - Token: %s
 
 Option B (OAuth 2.1):
-  - Client ID: %s
-  - Client Secret: %s
+  - Discovery: %s/%s/.well-known/oauth-authorization-server
   - Authorization URL: %s/%s/oauth/authorize
   - Token URL: %s/%s/oauth/token
+  - Dynamic Client Registration: %s/%s/oauth/register
+  - Identity Authorization: Authorize with your MCP Token on the consent prompt
 
 To share a directory, run:
   aestrl share ./project
 `, cfg.Identity, cfg.HubURL, cfg.MCPEndpoint(), cfg.MCPEndpoint(), cfg.MCPToken,
-		cfg.Identity, cfg.MCPToken, baseURL, cfg.Identity, baseURL, cfg.Identity)
+		baseURL, cfg.Identity, baseURL, cfg.Identity, baseURL, cfg.Identity, baseURL, cfg.Identity)
 }
 
 func runHub(args []string) {
