@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -106,6 +107,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else if clientID := r.Header.Get("X-Client-Id"); clientID != "" {
 			sessionID = clientID
 		}
+	}
+	if sessionID == "" && token != "" {
+		tokenHash := sha256.Sum256([]byte(token))
+		sessionID = "auth-" + hex.EncodeToString(tokenHash[:16])
 	}
 	if sessionID == "" {
 		// Generate random session ID or derive from caller IP

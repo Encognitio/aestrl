@@ -1224,4 +1224,198 @@ func TestCrossSession_StrictIsolationAndNegativeCases(t *testing.T) {
 	}
 }
 
+// TestChatGPT_SessionContinuityAcrossSeparateRequests verifies that ChatGPT's stateless
+// HTTP tool calls (without Mcp-Session-Id header) maintain session continuity and authorization
+// across separate HTTP requests, while isolating unrelated clients.
+func TestChatGPT_SessionContinuityAcrossSeparateRequests(t *testing.T) {
+	_, ts, cleanup := startTestHub(t)
+	defer cleanup()
+
+	ident := config.GenerateIdentityID()
+	hostToken, _ := config.GenerateSecureToken(16)
+	mcpToken, _ := config.GenerateSecureToken(16)
+
+	regJSON, _ := json.Marshal(hub.SetupRequest{
+		Identity:  ident,
+		HostToken: hostToken,
+		MCPToken:  mcpToken,
+	})
+	resSetup, err := http.Post(ts.URL+"/api/setup", "application/json", bytes.NewReader(regJSON))
+	if err != nil || resSetup.StatusCode != http.StatusOK {
+		t.Fatalf("setup failed: %v", err)
+	}
+	resSetup.Body.Close()
+
+	testDir, cleanDir := createTestDirectory(t, "chatgpt-continuity", "CHATGPT_CONTINUITY_SUCCESS")
+	defer cleanDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := &config.Config{
+		Identity:  ident,
+		HubURL:    ts.URL,
+		HostToken: hostToken,
+		MCPToken:  mcpToken,
+	}
+
+	sess, err := host.StartShare(ctx, cfg, testDir, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("StartShare failed: %v", err)
+	}
+	defer sess.Close()
+
+	mcpEndpoint := fmt.Sprintf("%s/%s/mcp", ts.URL, ident)
+
+	// Step 1: ChatGPT tool call 1 - connect_share WITHOUT Mcp-Session-Id header
+	connReq := mcp.Request{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params: json.RawMessage(fmt.Sprintf(`{
+			"name": "connect_share",
+			"arguments": {
+				"share_url": "%s"
+			}
+		}`, sess.ShareURL)),
+	}
+	connBytes, _ := json.Marshal(connReq)
+	httpReq1, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(connBytes))
+	httpReq1.Header.Set("Authorization", "Bearer "+mcpToken)
+	// Notice: NO Mcp-Session-Id header (stateless ChatGPT tool runner)
+
+	connRes, err := http.DefaultClient.Do(httpReq1)
+	if err != nil || connRes.StatusCode != http.StatusOK {
+		t.Fatalf("connect_share HTTP failed: %v", err)
+	}
+	var connRPCResp mcp.Response
+	_ = json.NewDecoder(connRes.Body).Decode(&connRPCResp)
+	connRes.Body.Close()
+
+	if connRPCResp.Error != nil {
+		t.Fatalf("connect_share RPC error: %+v", connRPCResp.Error)
+	}
+	connResult, ok := connRPCResp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("invalid connect_share result: %+v", connRPCResp.Result)
+	}
+	contentList := connResult["content"].([]interface{})
+	var parsedConn map[string]interface{}
+	if err := json.Unmarshal([]byte(contentList[0].(map[string]interface{})["text"].(string)), &parsedConn); err != nil {
+		t.Fatalf("failed to parse connect_share content JSON: %v", err)
+	}
+	shareID, _ := parsedConn["share_id"].(string)
+	if shareID == "" {
+		t.Fatalf("expected share_id in result, got: %+v", parsedConn)
+	}
+
+	// Step 2: ChatGPT tool call 2 - list_directory in a separate HTTP request, WITHOUT Mcp-Session-Id header
+	listReq := mcp.Request{
+		JSONRPC: "2.0",
+		ID:      2,
+		Method:  "tools/call",
+		Params: json.RawMessage(fmt.Sprintf(`{
+			"name": "list_directory",
+			"arguments": {
+				"share_id": "%s",
+				"path": ""
+			}
+		}`, shareID)),
+	}
+	listBytes, _ := json.Marshal(listReq)
+	httpReq2, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(listBytes))
+	httpReq2.Header.Set("Authorization", "Bearer "+mcpToken)
+	// Notice: NO Mcp-Session-Id header
+
+	listRes, err := http.DefaultClient.Do(httpReq2)
+	if err != nil || listRes.StatusCode != http.StatusOK {
+		t.Fatalf("list_directory HTTP failed: %v", err)
+	}
+	var listRPCResp mcp.Response
+	_ = json.NewDecoder(listRes.Body).Decode(&listRPCResp)
+	listRes.Body.Close()
+
+	if listRPCResp.Error != nil {
+		t.Fatalf("list_directory RPC error: %+v", listRPCResp.Error)
+	}
+	listResult, ok := listRPCResp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("invalid list_directory result: %+v", listRPCResp.Result)
+	}
+	if isErr, ok := listResult["isError"].(bool); ok && isErr {
+		t.Fatalf("list_directory returned error result: %+v", listResult)
+	}
+
+	// Step 3: ChatGPT tool call 3 - read_file in a separate HTTP request, WITHOUT Mcp-Session-Id header
+	readReq := mcp.Request{
+		JSONRPC: "2.0",
+		ID:      3,
+		Method:  "tools/call",
+		Params: json.RawMessage(fmt.Sprintf(`{
+			"name": "read_file",
+			"arguments": {
+				"share_id": "%s",
+				"path": "src/main.go"
+			}
+		}`, shareID)),
+	}
+	readBytes, _ := json.Marshal(readReq)
+	httpReq3, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(readBytes))
+	httpReq3.Header.Set("Authorization", "Bearer "+mcpToken)
+	// Notice: NO Mcp-Session-Id header
+
+	readRes, err := http.DefaultClient.Do(httpReq3)
+	if err != nil || readRes.StatusCode != http.StatusOK {
+		t.Fatalf("read_file HTTP failed: %v", err)
+	}
+	var readRPCResp mcp.Response
+	_ = json.NewDecoder(readRes.Body).Decode(&readRPCResp)
+	readRes.Body.Close()
+
+	if readRPCResp.Error != nil {
+		t.Fatalf("read_file RPC error: %+v", readRPCResp.Error)
+	}
+	readResult, ok := readRPCResp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("invalid read_file result: %+v", readRPCResp.Result)
+	}
+	if isErr, ok := readResult["isError"].(bool); ok && isErr {
+		t.Fatalf("read_file returned error result: %+v", readResult)
+	}
+	contentList = readResult["content"].([]interface{})
+	readText := contentList[0].(map[string]interface{})["text"].(string)
+	if !strings.Contains(readText, "CHATGPT_CONTINUITY_SUCCESS") {
+		t.Fatalf("expected file content to contain CHATGPT_CONTINUITY_SUCCESS, got:\n%s", readText)
+	}
+
+	// Step 4: Negative check - An unrelated client with a different token cannot access this share
+	unrelatedToken, _ := config.GenerateSecureToken(16)
+	unrelatedReq := mcp.Request{
+		JSONRPC: "2.0",
+		ID:      4,
+		Method:  "tools/call",
+		Params: json.RawMessage(fmt.Sprintf(`{
+			"name": "read_file",
+			"arguments": {
+				"share_id": "%s",
+				"path": "src/main.go"
+			}
+		}`, shareID)),
+	}
+	unrelatedBytes, _ := json.Marshal(unrelatedReq)
+	httpReq4, _ := http.NewRequest(http.MethodPost, mcpEndpoint, bytes.NewReader(unrelatedBytes))
+	httpReq4.Header.Set("Authorization", "Bearer "+unrelatedToken)
+
+	unrelatedRes, err := http.DefaultClient.Do(httpReq4)
+	if err != nil {
+		t.Fatalf("unrelated request failed: %v", err)
+	}
+	defer unrelatedRes.Body.Close()
+	// Unrelated token must be rejected with 401 Unauthorized
+	if unrelatedRes.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for unrelated client token, got: %d", unrelatedRes.StatusCode)
+	}
+}
+
 var _ = hex.EncodeToString
+
