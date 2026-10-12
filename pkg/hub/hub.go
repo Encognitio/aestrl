@@ -102,7 +102,7 @@ func New(cfg Config, webAssets http.FileSystem) (*Hub, error) {
 		hosts:       make(map[string][]*HostConnection),
 		shares:      make(map[string]*ActiveShare),
 		mcpSessions: make(map[string]*MCPSession),
-		oauth:       NewOAuthManager(),
+		oauth:       NewOAuthManager(cfg.DataDir),
 		webAssets:   webAssets,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {

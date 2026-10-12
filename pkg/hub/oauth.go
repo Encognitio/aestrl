@@ -8,6 +8,8 @@ import (
 	"html"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -17,10 +19,12 @@ import (
 
 // ClientRegistration represents a registered OAuth client (DCR, CIMD, or Predefined).
 type ClientRegistration struct {
-	ClientID     string   `json:"client_id"`
-	ClientSecret string   `json:"client_secret,omitempty"`
-	ClientName   string   `json:"client_name,omitempty"`
-	RedirectURIs []string `json:"redirect_uris"`
+	ClientID     string    `json:"client_id"`
+	ClientSecret string    `json:"client_secret,omitempty"`
+	ClientName   string    `json:"client_name,omitempty"`
+	RedirectURIs []string  `json:"redirect_uris"`
+	Identity     string    `json:"identity,omitempty"`
+	CreatedAt    time.Time `json:"created_at,omitempty"`
 }
 
 // OAuthCode represents an issued authorization code with PKCE challenge.
@@ -38,32 +42,137 @@ type OAuthCode struct {
 
 // OAuthToken represents an issued access token.
 type OAuthToken struct {
-	Token     string
-	Identity  string
-	Scope     string
-	ClientID  string
-	ExpiresAt time.Time
+	Token     string    `json:"token"`
+	Identity  string    `json:"identity"`
+	Scope     string    `json:"scope"`
+	ClientID  string    `json:"client_id"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // OAuthManager manages OAuth 2.1 authorization codes, client registrations, and access tokens.
 type OAuthManager struct {
+	dataDir string
 	codes   map[string]*OAuthCode
 	tokens  map[string]*OAuthToken
 	clients map[string]*ClientRegistration
 	mu      sync.RWMutex
 }
 
-// NewOAuthManager creates a new in-memory OAuth 2.1 manager.
-func NewOAuthManager() *OAuthManager {
-	return &OAuthManager{
+// NewOAuthManager creates a new OAuth 2.1 manager with persistent client and token storage.
+func NewOAuthManager(dataDir string) *OAuthManager {
+	m := &OAuthManager{
+		dataDir: dataDir,
 		codes:   make(map[string]*OAuthCode),
 		tokens:  make(map[string]*OAuthToken),
 		clients: make(map[string]*ClientRegistration),
 	}
+	if dataDir != "" {
+		_ = m.loadClients()
+		_ = m.loadTokens()
+	}
+	return m
 }
 
-// RegisterClient dynamically registers an OAuth client (RFC 7591 DCR).
-func (m *OAuthManager) RegisterClient(clientName string, redirectURIs []string) (*ClientRegistration, error) {
+func (m *OAuthManager) loadClients() error {
+	filePath := filepath.Join(m.dataDir, "oauth_clients.json")
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read oauth_clients.json: %w", err)
+	}
+
+	var list []*ClientRegistration
+	if err := json.Unmarshal(data, &list); err != nil {
+		return fmt.Errorf("invalid oauth_clients.json: %w", err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, reg := range list {
+		if reg.ClientID != "" {
+			m.clients[reg.ClientID] = reg
+		}
+	}
+	return nil
+}
+
+func (m *OAuthManager) saveClients() error {
+	if m.dataDir == "" {
+		return nil
+	}
+	filePath := filepath.Join(m.dataDir, "oauth_clients.json")
+	var list []*ClientRegistration
+	for _, reg := range m.clients {
+		list = append(list, reg)
+	}
+
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	tmpFile := filePath + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmpFile, filePath)
+}
+
+func (m *OAuthManager) loadTokens() error {
+	filePath := filepath.Join(m.dataDir, "oauth_tokens.json")
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read oauth_tokens.json: %w", err)
+	}
+
+	var list []*OAuthToken
+	if err := json.Unmarshal(data, &list); err != nil {
+		return fmt.Errorf("invalid oauth_tokens.json: %w", err)
+	}
+
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, tok := range list {
+		if tok.Token != "" && tok.ExpiresAt.After(now) {
+			m.tokens[tok.Token] = tok
+		}
+	}
+	return nil
+}
+
+func (m *OAuthManager) saveTokens() error {
+	if m.dataDir == "" {
+		return nil
+	}
+	filePath := filepath.Join(m.dataDir, "oauth_tokens.json")
+	var list []*OAuthToken
+	now := time.Now()
+	for _, tok := range m.tokens {
+		if tok.ExpiresAt.After(now) {
+			list = append(list, tok)
+		}
+	}
+
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	tmpFile := filePath + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmpFile, filePath)
+}
+
+// RegisterClient dynamically registers an OAuth client (RFC 7591 DCR) scoped to an identity.
+func (m *OAuthManager) RegisterClient(identity, clientName string, redirectURIs []string) (*ClientRegistration, error) {
 	if len(redirectURIs) == 0 {
 		return nil, fmt.Errorf("at least one redirect_uri is required")
 	}
@@ -98,17 +207,25 @@ func (m *OAuthManager) RegisterClient(clientName string, redirectURIs []string) 
 		ClientSecret: clientSecret,
 		ClientName:   clientName,
 		RedirectURIs: redirectURIs,
+		Identity:     identity,
+		CreatedAt:    time.Now(),
 	}
 
 	m.mu.Lock()
 	m.clients[clientID] = reg
+	saveErr := m.saveClients()
 	m.mu.Unlock()
+
+	if saveErr != nil {
+		return nil, fmt.Errorf("failed to persist client registration: %w", saveErr)
+	}
 
 	return reg, nil
 }
 
-// ValidateClient validates client_id and redirect_uri against DCR, CIMD, or Predefined clients.
-func (m *OAuthManager) ValidateClient(clientID, redirectURI string) error {
+// ValidateClient validates client_id and redirect_uri against DCR, CIMD, or Predefined clients,
+// enforcing identity scoping for dynamically registered clients.
+func (m *OAuthManager) ValidateClient(identity, clientID, redirectURI string) error {
 	if clientID == "" {
 		return fmt.Errorf("missing client_id")
 	}
@@ -137,6 +254,10 @@ func (m *OAuthManager) ValidateClient(clientID, redirectURI string) error {
 	reg, exists := m.clients[clientID]
 	m.mu.RUnlock()
 	if exists {
+		// Enforce identity scoping: DCR client registered for one identity cannot be used for another
+		if identity != "" && reg.Identity != "" && reg.Identity != identity {
+			return fmt.Errorf("client_id %s is not authorized for identity %s", clientID, identity)
+		}
 		matched := false
 		for _, u := range reg.RedirectURIs {
 			if u == redirectURI || strings.HasPrefix(redirectURI, strings.TrimSuffix(u, "/")) {
@@ -297,6 +418,7 @@ func (m *OAuthManager) ExchangeCode(code, verifier, redirectURI, clientID, resou
 		ClientID:  rec.ClientID,
 		ExpiresAt: time.Now().Add(30 * 24 * time.Hour), // 30 days
 	}
+	_ = m.saveTokens()
 
 	return accessToken, rec.Scope, rec.Identity, nil
 }
@@ -317,6 +439,7 @@ func (m *OAuthManager) IssueTokenForIdentity(identity, scope, clientID string) (
 		ClientID:  clientID,
 		ExpiresAt: time.Now().Add(30 * 24 * time.Hour),
 	}
+	_ = m.saveTokens()
 	return token, nil
 }
 
@@ -396,6 +519,20 @@ func (h *Hub) HandleOAuthRegister(w http.ResponseWriter, r *http.Request, identi
 		return
 	}
 
+	// Verify identity exists
+	h.mu.RLock()
+	_, exists := h.identities[identity]
+	h.mu.RUnlock()
+	if !exists {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":             "invalid_request",
+			"error_description": "Identity not found",
+		})
+		return
+	}
+
 	var req struct {
 		ClientName   string   `json:"client_name"`
 		RedirectURIs []string `json:"redirect_uris"`
@@ -411,7 +548,7 @@ func (h *Hub) HandleOAuthRegister(w http.ResponseWriter, r *http.Request, identi
 		return
 	}
 
-	reg, err := h.oauth.RegisterClient(req.ClientName, req.RedirectURIs)
+	reg, err := h.oauth.RegisterClient(identity, req.ClientName, req.RedirectURIs)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -481,7 +618,7 @@ func (h *Hub) HandleOAuthAuthorize(w http.ResponseWriter, r *http.Request, ident
 	}
 
 	// 2. Validate client & redirect_uri
-	if err := h.oauth.ValidateClient(clientID, redirectURI); err != nil {
+	if err := h.oauth.ValidateClient(identity, clientID, redirectURI); err != nil {
 		http.Error(w, fmt.Sprintf("invalid_client or redirect_uri: %v", err), http.StatusBadRequest)
 		return
 	}

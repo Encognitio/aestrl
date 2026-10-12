@@ -1417,5 +1417,350 @@ func TestChatGPT_SessionContinuityAcrossSeparateRequests(t *testing.T) {
 	}
 }
 
+// TestOAuth_DCR_PersistenceAcrossRestartsAndIdentityScoping verifies:
+// 1. DCR registration persistence in data dir across hub restarts.
+// 2. Re-authorization using the same client ID after hub restart.
+// 3. Pre-existing token persistence across restarts.
+// 4. Strict identity scoping (clients registered for identA cannot authorize for identB).
+// 5. Multiple independently registered clients.
+func TestOAuth_DCR_PersistenceAcrossRestartsAndIdentityScoping(t *testing.T) {
+	hubDataDir, err := os.MkdirTemp("", "aestrl-dcr-persist-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(hubDataDir)
+
+	identA := config.GenerateIdentityID()
+	hostTokenA, _ := config.GenerateSecureToken(16)
+	mcpTokenA, _ := config.GenerateSecureToken(16)
+
+	identB := config.GenerateIdentityID()
+	hostTokenB, _ := config.GenerateSecureToken(16)
+	mcpTokenB, _ := config.GenerateSecureToken(16)
+
+	// Phase 1: Start Hub 1
+	hub1, err := hub.New(hub.Config{DataDir: hubDataDir}, web.FS())
+	if err != nil {
+		t.Fatalf("failed to create hub1: %v", err)
+	}
+	ts1 := httptest.NewServer(hub1.Handler())
+
+	// Register identities on Hub 1
+	regA, _ := json.Marshal(hub.SetupRequest{Identity: identA, HostToken: hostTokenA, MCPToken: mcpTokenA})
+	resA, err := http.Post(ts1.URL+"/api/setup", "application/json", bytes.NewReader(regA))
+	if err != nil || resA.StatusCode != http.StatusOK {
+		t.Fatalf("setup identA failed: %v", err)
+	}
+	resA.Body.Close()
+
+	regB, _ := json.Marshal(hub.SetupRequest{Identity: identB, HostToken: hostTokenB, MCPToken: mcpTokenB})
+	resB, err := http.Post(ts1.URL+"/api/setup", "application/json", bytes.NewReader(regB))
+	if err != nil || resB.StatusCode != http.StatusOK {
+		t.Fatalf("setup identB failed: %v", err)
+	}
+	resB.Body.Close()
+
+	testDirA, cleanDirA := createTestDirectory(t, "dcr-persist", "DCR_PERSISTENCE_SUCCESS")
+	defer cleanDirA()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+
+	cfgA := &config.Config{Identity: identA, HubURL: ts1.URL, HostToken: hostTokenA, MCPToken: mcpTokenA}
+	sessA1, err := host.StartShare(ctx1, cfgA, testDirA, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("StartShare A1 failed: %v", err)
+	}
+	defer sessA1.Close()
+
+	// Step 1: Register Client 1 (ChatGPT) on Ident A via DCR
+	redirectTarget1 := "https://chatgpt.com/api/aip/plugin-oauth/callback"
+	regBody1, _ := json.Marshal(map[string]interface{}{
+		"client_name":   "ChatGPT Web Integration",
+		"redirect_uris": []string{redirectTarget1},
+	})
+	resReg1, err := http.Post(fmt.Sprintf("%s/%s/oauth/register", ts1.URL, identA), "application/json", bytes.NewReader(regBody1))
+	if err != nil || resReg1.StatusCode != http.StatusCreated {
+		t.Fatalf("DCR client 1 registration failed: status %d, err %v", resReg1.StatusCode, err)
+	}
+	var regData1 struct {
+		ClientID string `json:"client_id"`
+	}
+	_ = json.NewDecoder(resReg1.Body).Decode(&regData1)
+	resReg1.Body.Close()
+	if regData1.ClientID == "" {
+		t.Fatal("empty client_id for client 1")
+	}
+
+	// Step 2: Register Client 2 (Independent Agent) on Ident A via DCR
+	redirectTarget2 := "https://agent.example.com/oauth/callback"
+	regBody2, _ := json.Marshal(map[string]interface{}{
+		"client_name":   "Independent Agent",
+		"redirect_uris": []string{redirectTarget2},
+	})
+	resReg2, err := http.Post(fmt.Sprintf("%s/%s/oauth/register", ts1.URL, identA), "application/json", bytes.NewReader(regBody2))
+	if err != nil || resReg2.StatusCode != http.StatusCreated {
+		t.Fatalf("DCR client 2 registration failed: status %d, err %v", resReg2.StatusCode, err)
+	}
+	var regData2 struct {
+		ClientID string `json:"client_id"`
+	}
+	_ = json.NewDecoder(resReg2.Body).Decode(&regData2)
+	resReg2.Body.Close()
+	if regData2.ClientID == "" {
+		t.Fatal("empty client_id for client 2")
+	}
+
+	// Step 3: Register Client 3 on Ident B via DCR
+	redirectTarget3 := "https://other.example.com/callback"
+	regBody3, _ := json.Marshal(map[string]interface{}{
+		"client_name":   "Ident B Client",
+		"redirect_uris": []string{redirectTarget3},
+	})
+	resReg3, err := http.Post(fmt.Sprintf("%s/%s/oauth/register", ts1.URL, identB), "application/json", bytes.NewReader(regBody3))
+	if err != nil || resReg3.StatusCode != http.StatusCreated {
+		t.Fatalf("DCR client 3 registration failed: status %d, err %v", resReg3.StatusCode, err)
+	}
+	var regData3 struct {
+		ClientID string `json:"client_id"`
+	}
+	_ = json.NewDecoder(resReg3.Body).Decode(&regData3)
+	resReg3.Body.Close()
+
+	// Step 4: Complete Authorize + Token Exchange for Client 1 on Hub 1
+	codeVerifier1 := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	h1 := sha256.Sum256([]byte(codeVerifier1))
+	codeChallenge1 := base64.RawURLEncoding.EncodeToString(h1[:])
+
+	noRedirectClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	approveForm1 := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {regData1.ClientID},
+		"redirect_uri":          {redirectTarget1},
+		"state":                 {"state-hub1"},
+		"code_challenge":        {codeChallenge1},
+		"code_challenge_method": {"S256"},
+		"identity_token":        {mcpTokenA},
+		"action":                {"approve"},
+	}
+	postAuth1, err := noRedirectClient.PostForm(fmt.Sprintf("%s/%s/oauth/authorize", ts1.URL, identA), approveForm1)
+	if err != nil || postAuth1.StatusCode != http.StatusFound {
+		t.Fatalf("authorize client 1 failed: status %d, err %v", postAuth1.StatusCode, err)
+	}
+	loc1, _ := url.Parse(postAuth1.Header.Get("Location"))
+	code1 := loc1.Query().Get("code")
+	postAuth1.Body.Close()
+
+	tokenRes1, err := http.PostForm(fmt.Sprintf("%s/%s/oauth/token", ts1.URL, identA), url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code1},
+		"code_verifier": {codeVerifier1},
+		"redirect_uri":  {redirectTarget1},
+		"client_id":     {regData1.ClientID},
+	})
+	if err != nil || tokenRes1.StatusCode != http.StatusOK {
+		t.Fatalf("token exchange 1 failed: status %d, err %v", tokenRes1.StatusCode, err)
+	}
+	var tokenData1 struct {
+		AccessToken string `json:"access_token"`
+	}
+	_ = json.NewDecoder(tokenRes1.Body).Decode(&tokenData1)
+	tokenRes1.Body.Close()
+
+	// Verify MCP call with token 1 on Hub 1
+	conn1Bytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"connect_share","arguments":{"share_url":"%s"}}`, sessA1.ShareURL)),
+	})
+	mcpReq1, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/%s/mcp", ts1.URL, identA), bytes.NewReader(conn1Bytes))
+	mcpReq1.Header.Set("Authorization", "Bearer "+tokenData1.AccessToken)
+	resMCP1, err := http.DefaultClient.Do(mcpReq1)
+	if err != nil || resMCP1.StatusCode != http.StatusOK {
+		t.Fatalf("MCP tool call on Hub 1 failed: %v", err)
+	}
+	resMCP1.Body.Close()
+
+	// =========================================================================
+	// PHASE 2: SIMULATE HUB RESTART / UPGRADE
+	// =========================================================================
+	cancel1()
+	ts1.Close()
+
+	// Start Hub 2 using the SAME data directory
+	hub2, err := hub.New(hub.Config{DataDir: hubDataDir}, web.FS())
+	if err != nil {
+		t.Fatalf("failed to create hub2: %v", err)
+	}
+	ts2 := httptest.NewServer(hub2.Handler())
+	defer ts2.Close()
+
+	// Re-attach host share to Hub 2
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	cfgA2 := &config.Config{Identity: identA, HubURL: ts2.URL, HostToken: hostTokenA, MCPToken: mcpTokenA}
+	sessA2, err := host.StartShare(ctx2, cfgA2, testDirA, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("StartShare A2 on Hub 2 failed: %v", err)
+	}
+	defer sessA2.Close()
+
+	// Step 5: Verify pre-existing token issued before restart is STILL VALID on Hub 2!
+	conn2Bytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      2,
+		Method:  "tools/call",
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"connect_share","arguments":{"share_url":"%s"}}`, sessA2.ShareURL)),
+	})
+	mcpReq2, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/%s/mcp", ts2.URL, identA), bytes.NewReader(conn2Bytes))
+	mcpReq2.Header.Set("Authorization", "Bearer "+tokenData1.AccessToken)
+	resMCP2, err := http.DefaultClient.Do(mcpReq2)
+	if err != nil || resMCP2.StatusCode != http.StatusOK {
+		t.Fatalf("pre-restart token failed on restarted Hub 2: status %d, err %v", resMCP2.StatusCode, err)
+	}
+	resMCP2.Body.Close()
+
+	// Step 6: ChatGPT re-authorizes using the SAME clientID_1 after Hub restart!
+	// This proves DCR registration was NOT lost during restart.
+	codeVerifierNew := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk_new"
+	hNew := sha256.Sum256([]byte(codeVerifierNew))
+	codeChallengeNew := base64.RawURLEncoding.EncodeToString(hNew[:])
+
+	approveFormNew := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {regData1.ClientID}, // SAME CLIENT ID!
+		"redirect_uri":          {redirectTarget1},
+		"state":                 {"state-hub2"},
+		"code_challenge":        {codeChallengeNew},
+		"code_challenge_method": {"S256"},
+		"identity_token":        {mcpTokenA},
+		"action":                {"approve"},
+	}
+	postAuthNew, err := noRedirectClient.PostForm(fmt.Sprintf("%s/%s/oauth/authorize", ts2.URL, identA), approveFormNew)
+	if err != nil || postAuthNew.StatusCode != http.StatusFound {
+		t.Fatalf("re-authorization with same client_id on Hub 2 failed: status %d, err %v", postAuthNew.StatusCode, err)
+	}
+	locNew, _ := url.Parse(postAuthNew.Header.Get("Location"))
+	codeNew := locNew.Query().Get("code")
+	postAuthNew.Body.Close()
+
+	tokenResNew, err := http.PostForm(fmt.Sprintf("%s/%s/oauth/token", ts2.URL, identA), url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {codeNew},
+		"code_verifier": {codeVerifierNew},
+		"redirect_uri":  {redirectTarget1},
+		"client_id":     {regData1.ClientID},
+	})
+	if err != nil || tokenResNew.StatusCode != http.StatusOK {
+		t.Fatalf("token exchange with re-authorized code failed: status %d, err %v", tokenResNew.StatusCode, err)
+	}
+	var tokenDataNew struct {
+		AccessToken string `json:"access_token"`
+	}
+	_ = json.NewDecoder(tokenResNew.Body).Decode(&tokenDataNew)
+	tokenResNew.Body.Close()
+
+	// Connect share with newly issued token
+	connNewBytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      2,
+		Method:  "tools/call",
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"connect_share","arguments":{"share_url":"%s"}}`, sessA2.ShareURL)),
+	})
+	mcpConnReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/%s/mcp", ts2.URL, identA), bytes.NewReader(connNewBytes))
+	mcpConnReq.Header.Set("Authorization", "Bearer "+tokenDataNew.AccessToken)
+	mcpConnRes, err := http.DefaultClient.Do(mcpConnReq)
+	if err != nil || mcpConnRes.StatusCode != http.StatusOK {
+		t.Fatalf("connect_share with newly issued token failed: %v", err)
+	}
+	mcpConnRes.Body.Close()
+
+	// Read file with newly issued token
+	readBytes, _ := json.Marshal(mcp.Request{
+		JSONRPC: "2.0",
+		ID:      3,
+		Method:  "tools/call",
+		Params:  json.RawMessage(fmt.Sprintf(`{"name":"read_file","arguments":{"share_id":"%s","path":"src/main.go"}}`, sessA2.SessionID)),
+	})
+	mcpReadReq, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/%s/mcp", ts2.URL, identA), bytes.NewReader(readBytes))
+	mcpReadReq.Header.Set("Authorization", "Bearer "+tokenDataNew.AccessToken)
+	mcpReadRes, err := http.DefaultClient.Do(mcpReadReq)
+	if err != nil || mcpReadRes.StatusCode != http.StatusOK {
+		t.Fatalf("read_file with newly issued token failed: %v", err)
+	}
+	var readRPC mcp.Response
+	_ = json.NewDecoder(mcpReadRes.Body).Decode(&readRPC)
+	mcpReadRes.Body.Close()
+	contentList := readRPC.Result.(map[string]interface{})["content"].([]interface{})
+	if !strings.Contains(contentList[0].(map[string]interface{})["text"].(string), "DCR_PERSISTENCE_SUCCESS") {
+		t.Fatalf("unexpected content: %+v", readRPC.Result)
+	}
+
+	// Step 7: Authorize Client 2 on Hub 2 (Requirement 8: multiple independently registered clients)
+	approveForm2 := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {regData2.ClientID},
+		"redirect_uri":          {redirectTarget2},
+		"state":                 {"state-client2"},
+		"code_challenge":        {codeChallengeNew},
+		"code_challenge_method": {"S256"},
+		"identity_token":        {mcpTokenA},
+		"action":                {"approve"},
+	}
+	postAuth2, err := noRedirectClient.PostForm(fmt.Sprintf("%s/%s/oauth/authorize", ts2.URL, identA), approveForm2)
+	if err != nil || postAuth2.StatusCode != http.StatusFound {
+		t.Fatalf("Client 2 authorize failed: status %d, err %v", postAuth2.StatusCode, err)
+	}
+	postAuth2.Body.Close()
+
+	// Step 8: Identity Scoping Enforcement (Requirement 4)
+	// Client 3 (registered for Ident B) CANNOT authorize on Ident A!
+	crossAuthReq, _ := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("%s/%s/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&code_challenge=%s&code_challenge_method=S256",
+			ts2.URL, identA, regData3.ClientID, url.QueryEscape(redirectTarget3), codeChallengeNew), nil)
+	crossAuthRes, _ := http.DefaultClient.Do(crossAuthReq)
+	if crossAuthRes.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request when Client 3 (Ident B) tries to authorize on Ident A, got: %d", crossAuthRes.StatusCode)
+	}
+	crossAuthRes.Body.Close()
+
+	// Client 1 (registered for Ident A) CANNOT authorize on Ident B!
+	crossAuthReq2, _ := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("%s/%s/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&code_challenge=%s&code_challenge_method=S256",
+			ts2.URL, identB, regData1.ClientID, url.QueryEscape(redirectTarget1), codeChallengeNew), nil)
+	crossAuthRes2, _ := http.DefaultClient.Do(crossAuthReq2)
+	if crossAuthRes2.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request when Client 1 (Ident A) tries to authorize on Ident B, got: %d", crossAuthRes2.StatusCode)
+	}
+	crossAuthRes2.Body.Close()
+
+	// Step 9: Non-existent / Unregistered client ID -> MUST FAIL (400)
+	fakeAuthReq, _ := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("%s/%s/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&code_challenge=%s&code_challenge_method=S256",
+			ts2.URL, identA, "unregistered-client-id", url.QueryEscape(redirectTarget1), codeChallengeNew), nil)
+	fakeAuthRes, _ := http.DefaultClient.Do(fakeAuthReq)
+	if fakeAuthRes.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for unregistered client_id, got: %d", fakeAuthRes.StatusCode)
+	}
+	fakeAuthRes.Body.Close()
+
+	// Step 10: Client 1 with tampered redirect URI -> MUST FAIL (400)
+	badURIAttack, _ := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("%s/%s/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&code_challenge=%s&code_challenge_method=S256",
+			ts2.URL, identA, regData1.ClientID, url.QueryEscape("https://evil.org/steal"), codeChallengeNew), nil)
+	badURIRes, _ := http.DefaultClient.Do(badURIAttack)
+	if badURIRes.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for unregistered redirect_uri, got: %d", badURIRes.StatusCode)
+	}
+	badURIRes.Body.Close()
+}
+
 var _ = hex.EncodeToString
+
 
