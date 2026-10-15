@@ -22,11 +22,18 @@ var (
 type Config struct {
 	Identity   string    `json:"identity"`
 	HubURL     string    `json:"hub_url"`
-	HostToken  string    `json:"host_token"`
-	MCPToken   string    `json:"mcp_token"`
+	HostToken  string    `json:"host_token,omitempty"`
 	DefaultTTL string    `json:"default_ttl,omitempty"`
+	AllowHTTP  bool      `json:"allow_http,omitempty"`
 	Exclusions []string  `json:"exclusions,omitempty"`
 	CreatedAt  time.Time `json:"created_at,omitempty"`
+}
+
+// ShareState represents persistent reusable share identity for a directory.
+type ShareState struct {
+	SessionID string    `json:"session_id"`
+	Secret    string    `json:"secret"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // DefaultHubURL is the default public coordinator address.
@@ -39,7 +46,6 @@ func DefaultConfigPath() (string, error) {
 	}
 	baseDir, err := os.UserConfigDir()
 	if err != nil {
-		// Fallback to home directory
 		home, hErr := os.UserHomeDir()
 		if hErr != nil {
 			return "", fmt.Errorf("unable to determine user config directory: %w", err)
@@ -47,6 +53,100 @@ func DefaultConfigPath() (string, error) {
 		baseDir = filepath.Join(home, ".config")
 	}
 	return filepath.Join(baseDir, "aestrl", "config.json"), nil
+}
+
+// SidecarConfigPath returns the path to a directory's local .aestrl/config.json.
+func SidecarConfigPath(dir string) string {
+	if dir == "" {
+		dir = "."
+	}
+	return filepath.Join(dir, ".aestrl", "config.json")
+}
+
+// DiscoverConfig discovers configuration using the priority:
+// 1. Target directory sidecar (.aestrl/config.json)
+// 2. Current working directory sidecar (.aestrl/config.json)
+// 3. AESTRL_CONFIG environment variable
+// 4. OS user config (~/.config/aestrl/config.json)
+func DiscoverConfig(targetDir string) (*Config, string, error) {
+	// 1. Target dir sidecar
+	if targetDir != "" {
+		sidecar := SidecarConfigPath(targetDir)
+		if cfg, err := Load(sidecar); err == nil {
+			return cfg, sidecar, nil
+		}
+	}
+
+	// 2. Current directory sidecar
+	cwdSidecar := SidecarConfigPath(".")
+	if cfg, err := Load(cwdSidecar); err == nil {
+		return cfg, cwdSidecar, nil
+	}
+
+	// 3. Environment or OS default
+	defPath, err := DefaultConfigPath()
+	if err != nil {
+		return nil, "", err
+	}
+	if cfg, err := Load(defPath); err == nil {
+		return cfg, defPath, nil
+	}
+
+	return nil, defPath, ErrConfigNotFound
+}
+
+// DiscoverShareState checks targetDir for existing reusable .aestrl/share.json.
+func DiscoverShareState(targetDir string) (string, string) {
+	if targetDir == "" {
+		targetDir = "."
+	}
+	stateFile := filepath.Join(targetDir, ".aestrl", "share.json")
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		return "", ""
+	}
+	var state ShareState
+	if err := json.Unmarshal(data, &state); err == nil && state.SessionID != "" && state.Secret != "" {
+		return state.SessionID, state.Secret
+	}
+	return "", ""
+}
+
+// SaveShareState saves reusable share session credentials to .aestrl/share.json.
+func SaveShareState(targetDir, sessionID, secret string) error {
+	if targetDir == "" {
+		targetDir = "."
+	}
+	dir := filepath.Join(targetDir, ".aestrl")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	state := ShareState{
+		SessionID: sessionID,
+		Secret:    secret,
+		UpdatedAt: time.Now(),
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "share.json"), data, 0600)
+}
+
+// DefaultConfig generates a new default configuration instance.
+func DefaultConfig() (*Config, error) {
+	token, err := GenerateSecureToken(16)
+	if err != nil {
+		return nil, err
+	}
+	return &Config{
+		Identity:   GenerateIdentityID(),
+		HubURL:     DefaultHubURL,
+		HostToken:  token,
+		DefaultTTL: "2h",
+		AllowHTTP:  true,
+		CreatedAt:  time.Now(),
+	}, nil
 }
 
 // GenerateIdentityID generates a cryptographically random, clean alphanumeric identity ID (e.g. 9 chars: "h7af8ven8").
@@ -132,24 +232,6 @@ func (c *Config) Save(customPath string) error {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 	return nil
-}
-
-// MCPEndpoint returns the full persistent MCP endpoint URL.
-func (c *Config) MCPEndpoint() string {
-	return fmt.Sprintf("%s/%s/mcp", strings.TrimRight(c.HubURL, "/"), c.Identity)
-}
-
-// HostWSEndpoint returns the WebSocket endpoint URL for host connection.
-func (c *Config) HostWSEndpoint() string {
-	hub := strings.TrimRight(c.HubURL, "/")
-	wsScheme := "ws"
-	if strings.HasPrefix(hub, "https://") {
-		wsScheme = "wss"
-		hub = strings.TrimPrefix(hub, "https://")
-	} else if strings.HasPrefix(hub, "http://") {
-		hub = strings.TrimPrefix(hub, "http://")
-	}
-	return fmt.Sprintf("%s://%s/%s/host/ws", wsScheme, hub, c.Identity)
 }
 
 // Export encodes the configuration into a compact base64 string for secure transfer.

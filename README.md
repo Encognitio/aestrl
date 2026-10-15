@@ -1,214 +1,109 @@
 # Aestrl
 
-> Portable P2P File Inspector with Persistent MCP Identity
+> Portable, read-only, peer-to-peer file inspection tool.
 
 [![Go](https://img.shields.io/badge/go-1.26+-00ADD8.svg)](https://golang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP%20%7C%20SSE-brightgreen.svg)](https://modelcontextprotocol.io)
 [![P2P](https://img.shields.io/badge/WebRTC-Pion%20Direct%20P2P-orange.svg)](https://github.com/pion/webrtc)
+[![Search](https://img.shields.io/badge/Hybrid%20Search-BM25%20%2B%20Potion%20Embeddings-purple.svg)](https://github.com/trengrj/go-potion)
 
-**Aestrl** allows users to temporarily share local directories with browsers, humans, ChatGPT, Codex, Gemini and other MCP-compatible agents with zero cloud uploads.
+**Aestrl** allows users to inspect local and remote codebases through encrypted peer-to-peer data channels with zero cloud file storage.
 
-Users install one portable binary, run `aestrl setup` once to configure a persistent MCP identity in ChatGPT, and can thereafter share any project temporarily. When a share link is pasted into ChatGPT, the assistant immediately inspects files directly on the host machine.
+Users run a single self-contained binary on their machine to temporarily share any project directory. Remote collaborators, terminal users, browsers, and AI agents inspect files, query code outlines, locate symbol definitions, and execute hybrid semantic searches directly on the host machine.
 
 ---
 
 ## Key Principles & Architecture
 
-- **Single Portable Binary**: Written in Go with embedded web UI assets (`go:embed`). No external runtime or dependencies.
-- **Persistent MCP Routing**: ChatGPT connects to a stable endpoint (`https://aestrl.dvrsfy.org/<identity>/mcp`) once. No reinstalling integrations for new shares.
-- **Outbound-Only Host Connection**: Hosts behind NAT/firewalls connect outbound over persistent TLS/WebSocket to the public hub. No open ports required.
-- **Direct Browser P2P (WebRTC)**: Web browsers negotiate direct encrypted P2P data channels with the host via Pion WebRTC. Direct P2P is mandatory; no TURN relays.
-- **Strictly Read-Only & Isolated**: Traversal and symlink escape protection, default secret/credential exclusions, bounded query sizes, and session revocation.
-- **Zero Cloud File Persistence**: Files remain on the host machine. Hub only transiently proxies MCP queries; Cloudflare is never in the inspection data path.
-
-### Traffic Flow
-
-```text
-[ ChatGPT / MCP Client ]
-         |
-         | HTTPS Streamable MCP
-         v
-[ Go Hub: aestrl.dvrsfy.org/<identity>/mcp ]
-         |
-         | Authenticated Outbound Persistent WebSocket
-         v
-[ Aestrl Host (User Machine) ]
-         |
-         v
-[ Local Shared Directory ]
-```
-
-```text
-[ Desktop / Mobile Browser ]
-         |
-         | WebRTC Signaling
-         v
-[ Direct Encrypted WebRTC Data Channel ]
-         |
-         v
-[ Aestrl Host (User Machine) ]
-```
+- **One Portable Binary**: Written in pure Go with embedded web UI assets (`go:embed`). No external runtime, database, or heavy dependencies.
+- **Encrypted WebRTC P2P Transport**: CLI, TUI, and Web browsers communicate with the host directly over encrypted WebRTC DataChannels (`aestrl-inspect`). No file inspection payloads pass through cloud relays.
+- **Unified 15 Core Operations**: Every interface (CLI, TUI, WebUI, and Hosted-AI) calls the exact same core engine dispatcher:
+  `ls`, `tree`, `stat`, `find`, `search`, `grep`, `context`, `read`, `outline`, `raw`, `symbol`, `refs`, `deps`, `compare`, `manifest`.
+- **Hybrid Retrieval (BM25 + CPU Semantic Embeddings)**: Fast lexical BM25 ranking coupled with CPU static embeddings using `go-potion` (`minishlab/potion-base-8M`), symbol weighting, and path relevance.
+- **Local Snapshot Indexing & Persistent Vectors**: Local index cache (`~/.aestrl/index/<shareID>.json`) persists file hashes and embedding vectors, enabling delta re-indexing upon re-sharing.
+- **Background Daemon & Multi-Share Management**: Local IPC socket (`~/.aestrl/daemon.sock`) manages multiple concurrent shares.
+- **Cloudflare Coordination**: One Worker at `aestrl.dvrsfy.org` provides ephemeral discovery records, WebRTC SDP signaling relay, browser UI delivery, and Hosted-AI HTTP 307 redirects.
+- **Removable Hosted-AI Adapter**: Optional HTTP/HTTPS interface with Let's Encrypt TLS and explicit HTTP fallback. Can be stripped at build time via `go build -tags noai`.
 
 ---
 
-## Installation
+## Installation & Build
 
-### Prebuilt Binaries
-Download the latest release for your platform from GitHub Releases, or build from source:
-
+### Standard Build (Full)
 ```bash
-git clone https://github.com/Encognitio/aestrl.git
-cd aestrl
 go build -ldflags="-s -w" -o aestrl ./cmd/aestrl
 ```
 
----
-
-## 1. Quick Start
-
-### Step 1: One-Time Persistent Setup
-
+### AI-Free Build (`noai`)
+Excludes Hosted-AI HTTP server, certificate dependencies, and endpoints:
 ```bash
-aestrl setup
+go build -tags noai -ldflags="-s -w" -o aestrl-noai ./cmd/aestrl
 ```
 
-Output:
-```text
-Aestrl configured.
+---
 
-Identity: h7af8ven8
-Hub: https://aestrl.dvrsfy.org
+## Usage
 
-Your permanent MCP endpoint:
-https://aestrl.dvrsfy.org/h7af8ven8/mcp
-
-ChatGPT / Custom MCP Client Configuration:
-Option A (Bearer / API Key):
-  - Server URL: https://aestrl.dvrsfy.org/h7af8ven8/mcp
-  - Authentication: Bearer Token / API Key
-  - Token: 3a9f02...
-
-Option B (OAuth 2.1):
-  - Discovery: https://aestrl.dvrsfy.org/h7af8ven8/.well-known/oauth-authorization-server
-  - Authorization URL: https://aestrl.dvrsfy.org/h7af8ven8/oauth/authorize
-  - Token URL: https://aestrl.dvrsfy.org/h7af8ven8/oauth/token
-  - Dynamic Registration: https://aestrl.dvrsfy.org/h7af8ven8/oauth/register
-  - Consent: Approves via prompt using persistent MCP token
-
-To share a directory, run:
-  aestrl share ./project
-```
-
-### Step 2: Configure ChatGPT Once
-
-1. Open ChatGPT -> **Settings** -> **Connected Apps** (or Custom Actions / Developer Mode / MCP).
-2. Add a new MCP server:
-   - **URL**: `https://aestrl.dvrsfy.org/<identity>/mcp`
-   - **Authentication**: Choose **Bearer Token / API Key** (enter `<mcp_token>`), or **OAuth 2.1** (uses RFC 8414 metadata discovery or URLs above).
-   - When authorizing via OAuth in the browser, confirm the identity and enter your persistent MCP token on the consent prompt.
-3. Save. This integration stays configured permanently across restarts, updates, and different projects.
-
-### Step 3: Share a Directory
-
+### 1. Configuration (`setup`)
+Configure persistent identity, coordinator URL, or directory sidecars:
 ```bash
-aestrl share ./my-project --ttl 2h
+aestrl setup                 # Global configuration (~/.config/aestrl/config.json)
+aestrl setup --sidecar       # Local directory sidecar (.aestrl/config.json)
+aestrl setup --export        # Export configuration as compact base64 string
+aestrl setup --import <str>  # Import configuration string
 ```
 
-Output:
-```text
-Aestrl sharing: /home/user/my-project
-
-Share:
-https://aestrl.dvrsfy.org/s/8f10b74ce12a45d0#c0a98f71b29e01f4...
-
-MCP:
-https://aestrl.dvrsfy.org/h7af8ven8/mcp
-
-Expires: 2 hours
-Press Ctrl+C to stop
-```
-
-### Step 4: Inspect in ChatGPT or Browser
-
-- **In ChatGPT**: Paste the share URL (`https://aestrl.dvrsfy.org/s/...#...`) into your chat. ChatGPT calls `connect_share` and can immediately browse, search, and inspect the project files.
-- **In Browser**: Click or open the share URL in Safari, Chrome, Firefox, or Edge (mobile & desktop) for real-time encrypted P2P inspection.
-
----
-
-## CLI Inspection Commands
-
-Inspect remote shares directly from the terminal without opening a browser:
-
+### 2. Sharing Directories
 ```bash
-# List directory contents
-aestrl ls https://aestrl.dvrsfy.org/s/<session>#<secret> [path]
+# Share current working directory (runs via background daemon)
+aestrl share
 
-# Recursive tree with depth limit
-aestrl tree https://aestrl.dvrsfy.org/s/<session>#<secret> [path] --depth 3
+# Share a specific path with 4-hour lifetime and Hosted-AI adapter enabled
+aestrl share ./my-project --ttl 4h --ai
 
-# Ripgrep-style content search (literal or regex) with line numbers
-aestrl rg https://aestrl.dvrsfy.org/s/<session>#<secret> "currentToken" src/
-
-# Read file or line range
-aestrl cat https://aestrl.dvrsfy.org/s/<session>#<secret> src/main.go --lines 20:60
-
-# Download remote file
-aestrl get https://aestrl.dvrsfy.org/s/<session>#<secret> assets/logo.png -o ./logo.png
+# Share in foreground (Ctrl+C to terminate)
+aestrl share ./my-project --foreground
 ```
 
-*Tip: Set `export AESTRL_SHARE="https://..."` to omit the URL from CLI commands.*
-
----
-
-## Model Context Protocol (MCP) Tools
-
-Aestrl exposes standard read-only MCP tools to ChatGPT and MCP clients:
-
-| Tool | Description |
-|------|-------------|
-| `connect_share` | Authorizes a temporary share URL for the conversation. |
-| `list_shares` | Lists all active shares under the persistent identity. |
-| `list_directory` | Lists directory contents (files, sizes, types). |
-| `tree` | Visual recursive directory tree with depth limits. |
-| `search_files` | Substring and glob filename matching. |
-| `search_content` | Regex and literal content search with line numbers and context. |
-| `read_file` | Bounded file reading with optional 1-indexed line ranges. |
-| `file_info` | Metadata, MIME type, and binary detection flags. |
-| `get_file` | Retrieve file content within transfer bounds. |
-
----
-
-## Self-Hosting the Hub
-
-You can run your own Aestrl public hub on any VPS:
-
+### 3. Share Management
 ```bash
-aestrl hub --listen :8080 --hub-url https://aestrl.yourdomain.com --data-dir /var/lib/aestrl
+aestrl status                # List active shares, paths, remaining TTL, and peers
+aestrl stop <session_id>     # Revoke a specific share
+aestrl stop all              # Revoke all active shares
 ```
 
-### Caddy Reverse Proxy Example
-
-```caddy
-aestrl.yourdomain.com {
-    reverse_proxy localhost:8080
-}
+### 4. Interactive Terminal Explorer (TUI)
+```bash
+aestrl                       # Interactive TUI for current directory (when in terminal)
+aestrl tui ./project         # Local directory TUI
+aestrl tui <share_url>       # Remote encrypted P2P TUI
 ```
 
-> **Important**: Configure `aestrl.yourdomain.com` as **DNS-only (Grey Cloud)** in Cloudflare to prevent Cloudflare from intercepting or proxying inspection data and WebSocket traffic.
+### 5. CLI Inspection (Local & Remote P2P)
+All commands work identically on local directories or remote share URLs:
+```bash
+aestrl ls [url] [path]          # List directory items
+aestrl tree [url] [path]        # Directory tree structure
+aestrl stat [url] <path>        # File or directory metadata
+aestrl find [url] <query>       # Find files by pattern
+aestrl search [url] <query>     # Hybrid BM25 + semantic ranked search
+aestrl grep [url] <pattern>     # Line-by-line regex or pattern search
+aestrl context [url] <query>    # Packaged high-relevance evidence within token budget
+aestrl cat [url] <path>         # Read file contents
+aestrl outline [url] <path>     # Extract functions, structs, classes, and headings
+aestrl raw [url] <path>         # Stream raw bytes (supports binary retrieval)
+aestrl symbol [url] <name>      # Locate symbol definitions across files
+aestrl refs [url] <name>        # Find symbol references and callers
+aestrl deps [url] <path>        # Analyze import dependencies
+aestrl compare [url] <p1> <p2>  # Compare diff between two files
+aestrl manifest [url]           # Complete repository manifest
+```
 
 ---
 
-## Security Guarantees
+## Security Boundaries
 
-1. **Strictly Read-Only**: Aestrl has zero write, modify, or execute capabilities.
-2. **Directory Root Boundary**: Uses `filepath.EvalSymlinks` and canonical prefix checking to block path traversal (`../`) and symlinks escaping the shared root.
-3. **Automatic Secret Exclusions**: Automatically excludes `.git`, `.env*`, `*credential*`, `*secret*`, `*.pem`, `*.key`, `id_rsa*`, `node_modules`, `vendor`, build caches, and sensitive files.
-4. **Transient Transit**: The hub never writes shared files to disk or caches file payloads.
-5. **Capability Isolation**: Share secrets are cryptographically random 128-bit hex strings stored in the URL fragment (`#<secret>`), which is never sent over HTTP to the server.
-
----
-
-## License
-
-MIT License. See [LICENSE](LICENSE) for details.
+1. **Jail Protection**: Real path evaluation and lexical directory containment reject symlink escapes and `../` traversal.
+2. **Capability Validation**: Every inspection request over WebRTC DataChannel requires the cryptographic secret fragment (`#<secret>`).
+3. **Strictly Read-Only**: Inspection engine contains zero write, delete, or shell execution capabilities.
+4. **Zero Cloud File Transfer**: Inspection payloads and file contents NEVER touch Cloudflare or intermediary servers.

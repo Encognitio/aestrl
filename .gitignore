@@ -1,5 +1,6 @@
 # Binaries
 /aestrl
+/aestrl-noai
 /aestrl.exe
 dist/
 bin/

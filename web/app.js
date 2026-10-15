@@ -725,6 +725,26 @@
     return div.innerHTML;
   }
 
+  // Global API exposing all 15 core operations over P2P DataChannel
+  window.aestrl = {
+    exec: sendRPC,
+    ls: (path) => sendRPC('ls', { path: path || '' }),
+    tree: (path, depth) => sendRPC('tree', { path: path || '', depth: depth || 3 }),
+    stat: (path) => sendRPC('stat', { path }),
+    find: (query, path) => sendRPC('find', { query, path: path || '' }),
+    search: (query, path) => sendRPC('search', { query, path: path || '' }),
+    grep: (query, path, isRegex) => sendRPC('grep', { query, path: path || '', is_regex: !!isRegex }),
+    context: (query, budget) => sendRPC('context', { query, budget: budget || 4000 }),
+    read: (path, start, end) => sendRPC('read', { path, start_line: start || 0, end_line: end || 0 }),
+    outline: (path) => sendRPC('outline', { path }),
+    raw: (path, offset, length) => sendRPC('raw', { path, offset: offset || 0, length: length || -1 }),
+    symbol: (name) => sendRPC('symbol', { name }),
+    refs: (name) => sendRPC('refs', { name }),
+    deps: (path) => sendRPC('deps', { path }),
+    compare: (p1, p2) => sendRPC('compare', { path1: p1, path2: p2 }),
+    manifest: () => sendRPC('manifest', {}),
+  };
+
   // Start on page load
   window.addEventListener('DOMContentLoaded', init);
 })();
