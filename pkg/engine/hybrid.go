@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Encognitio/aestrl/pkg/engine/model"
 	"github.com/trengrj/go-potion"
 )
 
@@ -23,8 +24,51 @@ var (
 	potionInitErr error
 )
 
+func ensureEmbeddedModel(modelKind potion.Model) error {
+	cacheDir := os.Getenv("GO_POTION_HOME")
+	if cacheDir == "" {
+		userCache, err := os.UserCacheDir()
+		if err != nil {
+			home, hErr := os.UserHomeDir()
+			if hErr != nil {
+				cacheDir = filepath.Join(os.TempDir(), "go-potion")
+			} else {
+				cacheDir = filepath.Join(home, ".cache", "go-potion")
+			}
+		} else {
+			cacheDir = filepath.Join(userCache, "go-potion")
+		}
+	}
+
+	modelDir := filepath.Join(cacheDir, string(modelKind))
+	if err := os.MkdirAll(modelDir, 0755); err != nil {
+		return err
+	}
+
+	stPath := filepath.Join(modelDir, "model.safetensors")
+	if fi, err := os.Stat(stPath); err != nil || fi.Size() == 0 {
+		if len(model.SafeTensors) > 0 {
+			if err := os.WriteFile(stPath, model.SafeTensors, 0644); err != nil {
+				return err
+			}
+		}
+	}
+
+	tokPath := filepath.Join(modelDir, "tokenizer.json")
+	if fi, err := os.Stat(tokPath); err != nil || fi.Size() == 0 {
+		if len(model.TokenizerJSON) > 0 {
+			if err := os.WriteFile(tokPath, model.TokenizerJSON, 0644); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 func getPotionEncoder() *potion.Potion {
 	potionOnce.Do(func() {
+		_ = ensureEmbeddedModel(potion.BASE8M)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		potionInst, potionInitErr = potion.New(ctx, potion.BASE8M)

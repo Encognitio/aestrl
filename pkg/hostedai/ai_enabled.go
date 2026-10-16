@@ -54,7 +54,7 @@ func StartServer(eng *engine.Engine, cfg Config, sessionID, secret string) (*Ser
 	var ln net.Listener
 	var pubURL string
 
-	// Attempt Let's Encrypt HTTPS if a domain is specified
+	// Attempt HTTPS if domain or direct public IP is specified
 	if cfg.Domain != "" && cfg.Domain != "localhost" && cfg.Domain != "127.0.0.1" {
 		certDir := cfg.CertDir
 		if certDir == "" {
@@ -66,28 +66,74 @@ func StartServer(eng *engine.Engine, cfg Config, sessionID, secret string) (*Ser
 		}
 		_ = os.MkdirAll(certDir, 0700)
 
-		m := &autocert.Manager{
-			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(cfg.Domain),
-			Cache:      autocert.DirCache(certDir),
-		}
+		ip := net.ParseIP(cfg.Domain)
+		if ip != nil {
+			// Direct public IP certificate management using Let's Encrypt shortlived profile
+			ipMgr := NewIPCertManager(ip, certDir)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			cert, err := ipMgr.ObtainCert(ctx)
+			cancel()
 
-		tlsConfig := m.TLSConfig()
-		tlsLn, err := tls.Listen("tcp", cfg.Addr, tlsConfig)
-		if err != nil {
-			if !cfg.AllowHTTP {
-				return nil, "", fmt.Errorf("Let's Encrypt HTTPS failed on %s: %w. Use --allow-http to explicitly approve unencrypted HTTP fallback", cfg.Domain, err)
+			if err != nil {
+				if !cfg.AllowHTTP {
+					return nil, "", fmt.Errorf("Let's Encrypt HTTPS for IP %s failed (shortlived profile): %w. Use --allow-http to explicitly approve unencrypted HTTP fallback", cfg.Domain, err)
+				}
+				// Explicit HTTP fallback approved
+				rawLn, hErr := net.Listen("tcp", cfg.Addr)
+				if hErr != nil {
+					return nil, "", fmt.Errorf("failed to bind HTTP fallback on %s: %w", cfg.Addr, hErr)
+				}
+				ln = rawLn
+				pubURL = fmt.Sprintf("http://%s", rawLn.Addr().String())
+			} else {
+				tlsConfig := &tls.Config{
+					Certificates: []tls.Certificate{*cert},
+					GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+						return cert, nil
+					},
+					NextProtos: []string{"h2", "http/1.1"},
+				}
+				tlsLn, tErr := tls.Listen("tcp", cfg.Addr, tlsConfig)
+				if tErr != nil {
+					if !cfg.AllowHTTP {
+						return nil, "", fmt.Errorf("failed to bind TLS on %s: %w", cfg.Addr, tErr)
+					}
+					rawLn, hErr := net.Listen("tcp", cfg.Addr)
+					if hErr != nil {
+						return nil, "", fmt.Errorf("failed to bind HTTP fallback on %s: %w", cfg.Addr, hErr)
+					}
+					ln = rawLn
+					pubURL = fmt.Sprintf("http://%s", rawLn.Addr().String())
+				} else {
+					ln = tlsLn
+					pubURL = fmt.Sprintf("https://%s", cfg.Domain)
+				}
 			}
-			// Explicit fallback approved
-			rawLn, hErr := net.Listen("tcp", cfg.Addr)
-			if hErr != nil {
-				return nil, "", fmt.Errorf("failed to bind HTTP fallback on %s: %w", cfg.Addr, hErr)
-			}
-			ln = rawLn
-			pubURL = fmt.Sprintf("http://%s", rawLn.Addr().String())
 		} else {
-			ln = tlsLn
-			pubURL = fmt.Sprintf("https://%s", cfg.Domain)
+			// Domain name using Let's Encrypt autocert
+			m := &autocert.Manager{
+				Prompt:     autocert.AcceptTOS,
+				HostPolicy: autocert.HostWhitelist(cfg.Domain),
+				Cache:      autocert.DirCache(certDir),
+			}
+
+			tlsConfig := m.TLSConfig()
+			tlsLn, err := tls.Listen("tcp", cfg.Addr, tlsConfig)
+			if err != nil {
+				if !cfg.AllowHTTP {
+					return nil, "", fmt.Errorf("Let's Encrypt HTTPS failed on %s: %w. Use --allow-http to explicitly approve unencrypted HTTP fallback", cfg.Domain, err)
+				}
+				// Explicit fallback approved
+				rawLn, hErr := net.Listen("tcp", cfg.Addr)
+				if hErr != nil {
+					return nil, "", fmt.Errorf("failed to bind HTTP fallback on %s: %w", cfg.Addr, hErr)
+				}
+				ln = rawLn
+				pubURL = fmt.Sprintf("http://%s", rawLn.Addr().String())
+			} else {
+				ln = tlsLn
+				pubURL = fmt.Sprintf("https://%s", cfg.Domain)
+			}
 		}
 	} else {
 		// Local or unencrypted HTTP

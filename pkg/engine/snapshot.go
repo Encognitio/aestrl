@@ -174,11 +174,22 @@ func (idx *HybridIndex) LoadOrDeltaIndex(snapshotFile string) (*DeltaReport, err
 	return delta, nil
 }
 
-// SnapshotDir returns ~/.aestrl/index or temp dir fallback.
+// SnapshotDir returns .aestrl/index beside executable, ~/.aestrl/index, or temp dir fallback.
+// Index files are always stored outside the shared directory tree.
 func SnapshotDir() string {
+	if exe, err := os.Executable(); err == nil {
+		sidecarDir := filepath.Join(filepath.Dir(exe), ".aestrl")
+		if fi, err := os.Stat(sidecarDir); err == nil && fi.IsDir() {
+			dir := filepath.Join(sidecarDir, "index")
+			_ = os.MkdirAll(dir, 0700)
+			return dir
+		}
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return filepath.Join(os.TempDir(), "aestrl", "index")
+		dir := filepath.Join(os.TempDir(), "aestrl", "index")
+		_ = os.MkdirAll(dir, 0700)
+		return dir
 	}
 	dir := filepath.Join(home, ".aestrl", "index")
 	_ = os.MkdirAll(dir, 0700)

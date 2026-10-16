@@ -19,11 +19,11 @@ Users run a single self-contained binary on their machine to temporarily share a
 - **Encrypted WebRTC P2P Transport**: CLI, TUI, and Web browsers communicate with the host directly over encrypted WebRTC DataChannels (`aestrl-inspect`). No file inspection payloads pass through cloud relays.
 - **Unified 15 Core Operations**: Every interface (CLI, TUI, WebUI, and Hosted-AI) calls the exact same core engine dispatcher:
   `ls`, `tree`, `stat`, `find`, `search`, `grep`, `context`, `read`, `outline`, `raw`, `symbol`, `refs`, `deps`, `compare`, `manifest`.
-- **Hybrid Retrieval (BM25 + CPU Semantic Embeddings)**: Fast lexical BM25 ranking coupled with CPU static embeddings using `go-potion` (`minishlab/potion-base-8M`), symbol weighting, and path relevance.
-- **Local Snapshot Indexing & Persistent Vectors**: Local index cache (`~/.aestrl/index/<shareID>.json`) persists file hashes and embedding vectors, enabling delta re-indexing upon re-sharing.
+- **Hybrid Retrieval (BM25 + Bundled CPU Semantic Embeddings)**: Fast lexical BM25 ranking coupled with pre-bundled static CPU embeddings (`minishlab/potion-base-8M`), running 100% offline with zero initial model downloads in a self-contained ~48 MB binary.
+- **Portable Discovery & Isolated State**: Prioritizes `.aestrl/` beside the executable for portable installs, falling back to OS configuration directory (`~/.config/aestrl/config.json`). Reusable share credentials and index vectors are stored strictly outside the shared filesystem tree.
 - **Background Daemon & Multi-Share Management**: Local IPC socket (`~/.aestrl/daemon.sock`) manages multiple concurrent shares.
 - **Cloudflare Coordination**: One Worker at `aestrl.dvrsfy.org` provides ephemeral discovery records, WebRTC SDP signaling relay, browser UI delivery, and Hosted-AI HTTP 307 redirects.
-- **Removable Hosted-AI Adapter**: Optional HTTP/HTTPS interface with Let's Encrypt TLS and explicit HTTP fallback. Can be stripped at build time via `go build -tags noai`.
+- **Removable Hosted-AI Adapter**: Optional HTTP/HTTPS interface with Let's Encrypt TLS (including direct public IP certificates via the `shortlived` profile) and explicit HTTP fallback. Can be stripped at build time via `go build -tags noai`.
 
 ---
 
@@ -107,3 +107,4 @@ aestrl manifest [url]           # Complete repository manifest
 2. **Capability Validation**: Every inspection request over WebRTC DataChannel requires the cryptographic secret fragment (`#<secret>`).
 3. **Strictly Read-Only**: Inspection engine contains zero write, delete, or shell execution capabilities.
 4. **Zero Cloud File Transfer**: Inspection payloads and file contents NEVER touch Cloudflare or intermediary servers.
+5. **Credential & Index Isolation**: Reusable share credentials and search indexes are stored externally (`~/.aestrl/` or executable sidecar), never inside the shared directory.

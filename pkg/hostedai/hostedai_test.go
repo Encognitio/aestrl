@@ -3,8 +3,11 @@
 package hostedai
 
 import (
+	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -105,3 +108,93 @@ func TestHostedAIServer(t *testing.T) {
 		t.Fatalf("expected 'Line 1', got %q", string(rangeBody))
 	}
 }
+
+func TestDirectIPCertificateAndHTTPS(t *testing.T) {
+	tempDir := t.TempDir()
+	certDir := filepath.Join(tempDir, "certs")
+	_ = os.MkdirAll(certDir, 0700)
+
+	testIP := net.ParseIP("127.0.0.2")
+	_, err := GenerateTestIPCert(testIP, certDir)
+	if err != nil {
+		t.Fatalf("failed to generate test IP cert: %v", err)
+	}
+
+	eng, err := engine.New(tempDir, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessionID := "testip123"
+	secret := "ipsecret456"
+
+	server, pubURL, err := StartServer(eng, Config{
+		Addr:      "127.0.0.2:0",
+		Domain:    "127.0.0.2",
+		CertDir:   certDir,
+		AllowHTTP: false,
+	}, sessionID, secret)
+	if err != nil {
+		t.Fatalf("failed to start HTTPS server with IP cert: %v", err)
+	}
+	defer server.Close()
+
+	if !strings.HasPrefix(pubURL, "https://127.0.0.2") {
+		t.Fatalf("expected https URL, got: %s", pubURL)
+	}
+
+	// Verify TLS connection succeeds
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{Transport: tr}
+	resp, err := client.Get(fmt.Sprintf("https://%s/?secret=%s&format=json", server.listener.Addr().String(), secret))
+	if err != nil {
+		t.Fatalf("HTTPS request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK over HTTPS, got: %d", resp.StatusCode)
+	}
+}
+
+func TestDirectIPFallbackToHTTP(t *testing.T) {
+	tempDir := t.TempDir()
+	certDir := filepath.Join(tempDir, "empty-certs")
+
+	eng, err := engine.New(tempDir, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. With AllowHTTP = true, failure to obtain Let's Encrypt cert should fall back to HTTP
+	server, pubURL, err := StartServer(eng, Config{
+		Addr:      "127.0.0.1:0",
+		Domain:    "203.0.113.1", // Non-routable test IP
+		CertDir:   certDir,
+		AllowHTTP: true,
+	}, "testfallback", "sec123")
+	if err != nil {
+		t.Fatalf("expected HTTP fallback to succeed, got error: %v", err)
+	}
+	defer server.Close()
+
+	if !strings.HasPrefix(pubURL, "http://") {
+		t.Fatalf("expected http fallback URL, got: %s", pubURL)
+	}
+
+	// 2. With AllowHTTP = false, failure to obtain cert must return clear error
+	_, _, err = StartServer(eng, Config{
+		Addr:      "127.0.0.1:0",
+		Domain:    "203.0.113.1",
+		CertDir:   certDir,
+		AllowHTTP: false,
+	}, "teststrict", "sec123")
+	if err == nil {
+		t.Fatal("expected error when HTTPS fails and AllowHTTP is false, got nil")
+	}
+	if !strings.Contains(err.Error(), "shortlived profile") || !strings.Contains(err.Error(), "--allow-http") {
+		t.Fatalf("expected error mentioning shortlived profile and --allow-http, got: %v", err)
+	}
+}
+

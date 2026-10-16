@@ -2,6 +2,7 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -55,6 +56,15 @@ func DefaultConfigPath() (string, error) {
 	return filepath.Join(baseDir, "aestrl", "config.json"), nil
 }
 
+// ExeSidecarConfigPath returns the path to .aestrl/config.json beside the running executable.
+func ExeSidecarConfigPath() string {
+	exe, err := os.Executable()
+	if err == nil {
+		return filepath.Join(filepath.Dir(exe), ".aestrl", "config.json")
+	}
+	return ""
+}
+
 // SidecarConfigPath returns the path to a directory's local .aestrl/config.json.
 func SidecarConfigPath(dir string) string {
 	if dir == "" {
@@ -64,12 +74,19 @@ func SidecarConfigPath(dir string) string {
 }
 
 // DiscoverConfig discovers configuration using the priority:
-// 1. Target directory sidecar (.aestrl/config.json)
-// 2. Current working directory sidecar (.aestrl/config.json)
-// 3. AESTRL_CONFIG environment variable
-// 4. OS user config (~/.config/aestrl/config.json)
+// 1. .aestrl/ beside the executable (.aestrl/config.json)
+// 2. Target directory sidecar (.aestrl/config.json) if specified
+// 3. Current working directory sidecar (.aestrl/config.json)
+// 4. AESTRL_CONFIG environment variable or OS user config (~/.config/aestrl/config.json)
 func DiscoverConfig(targetDir string) (*Config, string, error) {
-	// 1. Target dir sidecar
+	// 1. Beside executable sidecar
+	if exeSidecar := ExeSidecarConfigPath(); exeSidecar != "" {
+		if cfg, err := Load(exeSidecar); err == nil {
+			return cfg, exeSidecar, nil
+		}
+	}
+
+	// 2. Target dir sidecar
 	if targetDir != "" {
 		sidecar := SidecarConfigPath(targetDir)
 		if cfg, err := Load(sidecar); err == nil {
@@ -77,13 +94,13 @@ func DiscoverConfig(targetDir string) (*Config, string, error) {
 		}
 	}
 
-	// 2. Current directory sidecar
+	// 3. Current directory sidecar
 	cwdSidecar := SidecarConfigPath(".")
 	if cfg, err := Load(cwdSidecar); err == nil {
 		return cfg, cwdSidecar, nil
 	}
 
-	// 3. Environment or OS default
+	// 4. Environment or OS default
 	defPath, err := DefaultConfigPath()
 	if err != nil {
 		return nil, "", err
@@ -95,12 +112,48 @@ func DiscoverConfig(targetDir string) (*Config, string, error) {
 	return nil, defPath, ErrConfigNotFound
 }
 
-// DiscoverShareState checks targetDir for existing reusable .aestrl/share.json.
+// ShareStatePath returns a deterministic storage path for reusable share state
+// kept completely OUTSIDE the shared filesystem tree.
+func ShareStatePath(targetDir string) string {
+	abs, err := filepath.Abs(targetDir)
+	if err != nil {
+		abs = targetDir
+	}
+	h := sha256.Sum256([]byte(abs))
+	hashStr := hex.EncodeToString(h[:8])
+	baseName := filepath.Base(abs)
+	var cleanName strings.Builder
+	for _, r := range baseName {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			cleanName.WriteRune(r)
+		} else {
+			cleanName.WriteRune('_')
+		}
+	}
+	fileName := fmt.Sprintf("%s_%s.json", cleanName.String(), hashStr)
+
+	// Check if .aestrl beside executable exists
+	if exe, err := os.Executable(); err == nil {
+		sidecarDir := filepath.Join(filepath.Dir(exe), ".aestrl")
+		if fi, err := os.Stat(sidecarDir); err == nil && fi.IsDir() {
+			return filepath.Join(sidecarDir, "shares", fileName)
+		}
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "aestrl", "shares", fileName)
+	}
+	return filepath.Join(home, ".aestrl", "shares", fileName)
+}
+
+// DiscoverShareState checks persistent external storage for existing reusable share state.
+// Credentials are intentionally kept outside the shared filesystem tree.
 func DiscoverShareState(targetDir string) (string, string) {
 	if targetDir == "" {
 		targetDir = "."
 	}
-	stateFile := filepath.Join(targetDir, ".aestrl", "share.json")
+	stateFile := ShareStatePath(targetDir)
 	data, err := os.ReadFile(stateFile)
 	if err != nil {
 		return "", ""
@@ -112,12 +165,13 @@ func DiscoverShareState(targetDir string) (string, string) {
 	return "", ""
 }
 
-// SaveShareState saves reusable share session credentials to .aestrl/share.json.
+// SaveShareState saves reusable share session credentials to external persistent storage outside the shared directory.
 func SaveShareState(targetDir, sessionID, secret string) error {
 	if targetDir == "" {
 		targetDir = "."
 	}
-	dir := filepath.Join(targetDir, ".aestrl")
+	stateFile := ShareStatePath(targetDir)
+	dir := filepath.Dir(stateFile)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
@@ -130,7 +184,7 @@ func SaveShareState(targetDir, sessionID, secret string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "share.json"), data, 0600)
+	return os.WriteFile(stateFile, data, 0600)
 }
 
 // DefaultConfig generates a new default configuration instance.

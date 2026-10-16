@@ -148,7 +148,11 @@ func runSetup(args []string) {
 
 	targetPath := ""
 	if *sidecar {
-		targetPath = config.SidecarConfigPath(".")
+		if exeSidecar := config.ExeSidecarConfigPath(); exeSidecar != "" {
+			targetPath = exeSidecar
+		} else {
+			targetPath = config.SidecarConfigPath(".")
+		}
 	} else {
 		var err error
 		targetPath, err = config.DefaultConfigPath()
