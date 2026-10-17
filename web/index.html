@@ -34,8 +34,11 @@
       </div>
       <div class="p2p-status" id="p2p-status" title="WebRTC Connection">
         <span class="status-indicator status-connecting"></span>
-        <span id="p2p-text">Connecting P2P</span>
+        <span id="p2p-text">Connecting</span>
       </div>
+      <button class="btn btn-sm btn-outline" id="share-modal-btn" title="Share & QR Code">
+        ↗ Share
+      </button>
       <button class="icon-btn theme-toggle" id="theme-toggle" aria-label="Toggle Theme" title="Toggle Light/Dark Theme">
         🌓
       </button>
@@ -43,7 +46,25 @@
   </header>
 
   <!-- Connection / Error Banner -->
-  <div class="banner banner-hidden" id="notice-banner"></div>
+  <div class="banner banner-hidden" id="notice-banner">
+    <span class="banner-text" id="banner-text"></span>
+    <div class="banner-actions" id="banner-actions">
+      <button class="btn btn-xs btn-outline" id="banner-retry-btn" style="display: none;">Retry</button>
+      <button class="btn btn-xs btn-text" id="banner-dismiss-btn">✕</button>
+    </div>
+  </div>
+
+  <!-- Transfer Activity Indicator -->
+  <div class="transfer-bar" id="transfer-bar" style="display: none;">
+    <div class="transfer-info">
+      <span class="transfer-spin">⚡</span>
+      <span id="transfer-text">Transferring...</span>
+    </div>
+    <div class="transfer-progress-track">
+      <div class="transfer-progress-fill" id="transfer-progress-fill"></div>
+    </div>
+    <button class="btn btn-xs btn-outline" id="transfer-cancel-btn">Cancel</button>
+  </div>
 
   <div class="app-layout">
     <!-- Sidebar: Directory Tree Navigation -->
@@ -105,13 +126,16 @@
           <!-- Markdown preview container -->
           <div class="markdown-preview" id="markdown-container" style="display: none;"></div>
 
-          <!-- Media preview container -->
+          <!-- Media preview container (Images, Audio, Video) -->
           <div class="media-preview" id="media-container" style="display: none;"></div>
+
+          <!-- PDF preview container -->
+          <div class="pdf-preview" id="pdf-container" style="display: none;"></div>
 
           <!-- Binary preview container -->
           <div class="binary-notice" id="binary-container" style="display: none;">
             <div class="binary-icon">📦</div>
-            <p>This is a binary file. Inspection is available via download.</p>
+            <p id="binary-desc">This is a binary file. Inspection is available via download.</p>
             <button class="btn btn-primary" id="binary-download-btn">Download File</button>
           </div>
         </div>
@@ -126,6 +150,46 @@
         </div>
       </div>
     </main>
+  </div>
+
+  <!-- Share & QR Modal -->
+  <div class="modal-backdrop" id="share-modal" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Share Access</h3>
+        <button class="icon-btn" id="close-share-modal-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">Anyone with this link or QR code can inspect this shared codebase in their browser or terminal.</p>
+        
+        <!-- QR Code Display -->
+        <div class="qr-wrapper">
+          <div id="share-qr-canvas" class="qr-canvas"></div>
+          <span class="qr-hint">Scan with mobile camera to open</span>
+        </div>
+
+        <!-- Share Links -->
+        <div class="share-field">
+          <label>Browser &amp; P2P Link</label>
+          <div class="input-with-button">
+            <input type="text" id="share-browser-url" readonly>
+            <button class="btn btn-sm btn-primary" id="copy-browser-url-btn">Copy</button>
+          </div>
+        </div>
+
+        <div class="share-field" id="hosted-ai-field" style="display: none;">
+          <label>Hosted-AI HTTP Endpoint</label>
+          <div class="input-with-button">
+            <input type="text" id="share-ai-url" readonly>
+            <button class="btn btn-sm" id="copy-ai-url-btn">Copy</button>
+          </div>
+        </div>
+
+        <div class="share-footer-actions">
+          <button class="btn btn-outline" id="native-share-btn" style="display: none;">Share via Device...</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="/app.js"></script>

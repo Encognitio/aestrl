@@ -1,20 +1,180 @@
 /**
- * Aestrl Cloudflare Coordination Worker
+ * Aestrl Cloudflare Coordination Worker & Signaling Durable Object
  *
  * Responsibilities:
- * 1. Discovery records & session metadata.
- * 2. Public share URL resolution & browser asset delivery.
- * 3. WebRTC signaling relay (offer/answer exchange for P2P connection).
+ * 1. Durable Object-based WebRTC signaling relay across all Worker isolates.
+ * 2. Ephemeral discovery records & session metadata.
+ * 3. Static WebUI delivery for browser peer connections.
  * 4. Hosted-AI HTTP redirect handling (HTTP 307 to direct host IP/port).
  *
  * CRITICAL SECURITY INVARIANT:
- * File inspection payloads and contents NEVER pass through this Worker.
+ * File inspection payloads and contents NEVER pass through this Worker or Durable Object.
+ * Cloudflare only handles SDP offer/answer coordination and static UI assets.
+ * Established P2P sessions continue functioning completely independently of signaling availability.
  */
 
-// In-memory session registry and signaling mailboxes
-const sessions = new Map();
-const hostConnections = new Map();
-const pendingSignalRequests = new Map();
+// Local fallback maps when SIGNALING_DO is not bound (e.g., local tests or standard workers)
+const fallbackSessions = new Map();
+const fallbackHostSockets = new Map();
+const fallbackPendingSignals = new Map();
+
+/**
+ * SignalingDO provides globally consistent, isolate-independent WebRTC signaling.
+ * Each Aestrl session gets an isolated Durable Object instance.
+ */
+export class SignalingDO {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+    this.sessionMeta = null;
+    this.hostSocket = null;
+    this.pendingSignals = new Map();
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    // 1. Session registration
+    if (request.method === "POST" && url.pathname.endsWith("/register")) {
+      try {
+        const data = await request.json();
+        this.sessionMeta = {
+          session_id: data.session_id,
+          name: data.name || data.session_id,
+          secret_hash: data.secret_hash,
+          expires_at: data.expires_at,
+          direct_url: data.direct_url,
+          created_at: new Date().toISOString(),
+        };
+        if (this.ctx.storage) {
+          await this.ctx.storage.put("meta", this.sessionMeta);
+        }
+        return jsonResponse({ status: "registered", session_id: data.session_id });
+      } catch (e) {
+        return new Response("Invalid JSON: " + e.message, { status: 400 });
+      }
+    }
+
+    // 2. Metadata lookup
+    if (request.method === "GET" && (url.pathname.endsWith("/meta") || url.pathname.includes("/api/share/"))) {
+      if (!this.sessionMeta && this.ctx.storage) {
+        this.sessionMeta = await this.ctx.storage.get("meta");
+      }
+      if (this.sessionMeta) {
+        return jsonResponse({
+          session_id: this.sessionMeta.session_id,
+          name: this.sessionMeta.name,
+          expires_at: this.sessionMeta.expires_at,
+          has_host: !!(this.hostSocket && this.hostSocket.readyState === WebSocket.OPEN),
+        });
+      }
+      return jsonResponse({ error: "Session not found" }, 404);
+    }
+
+    // 3. Direct URL lookup (for Hosted-AI redirect)
+    if (url.pathname.endsWith("/direct_url")) {
+      if (!this.sessionMeta && this.ctx.storage) {
+        this.sessionMeta = await this.ctx.storage.get("meta");
+      }
+      return jsonResponse({ direct_url: this.sessionMeta ? this.sessionMeta.direct_url : null });
+    }
+
+    // 4. Host WebSocket connection (/host)
+    if (url.pathname.endsWith("/host")) {
+      const upgradeHeader = request.headers.get("Upgrade");
+      if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
+        return new Response("Expected WebSocket upgrade", { status: 426 });
+      }
+
+      const webSocketPair = new WebSocketPair();
+      const [client, server] = Object.values(webSocketPair);
+
+      server.accept();
+      this.hostSocket = server;
+
+      server.addEventListener("message", (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "answer" && msg.request_id) {
+            const resolver = this.pendingSignals.get(msg.request_id);
+            if (resolver) {
+              this.pendingSignals.delete(msg.request_id);
+              resolver(msg);
+            }
+          } else if (msg.type === "ping") {
+            server.send(JSON.stringify({ type: "pong" }));
+          }
+        } catch (_) {}
+      });
+
+      server.addEventListener("close", () => {
+        if (this.hostSocket === server) {
+          this.hostSocket = null;
+        }
+      });
+
+      return new Response(null, {
+        status: 101,
+        webSocket: client,
+      });
+    }
+
+    // 5. Client WebRTC SDP Signaling (/signal)
+    if (url.pathname.endsWith("/signal")) {
+      if (request.method !== "POST") {
+        return new Response("Method Not Allowed", { status: 405 });
+      }
+
+      // Check if host daemon is connected
+      if (!this.hostSocket || this.hostSocket.readyState !== WebSocket.OPEN) {
+        return new Response(
+          JSON.stringify({
+            error: "Host peer is currently offline or unreachable. Please verify 'aestrl share' is running on the host.",
+            code: "HOST_OFFLINE"
+          }),
+          { status: 503, headers: corsHeaders({ "Content-Type": "application/json" }) }
+        );
+      }
+
+      try {
+        const body = await request.json();
+        const reqID = "sig-" + Math.random().toString(36).substring(2, 11);
+
+        const answerPromise = new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            this.pendingSignals.delete(reqID);
+            reject(new Error("Timeout waiting for host SDP answer"));
+          }, 8000);
+
+          this.pendingSignals.set(reqID, (answerMsg) => {
+            clearTimeout(timer);
+            resolve(answerMsg);
+          });
+        });
+
+        // Forward SDP offer to host
+        this.hostSocket.send(JSON.stringify({
+          type: "offer",
+          request_id: reqID,
+          offer_sdp: body.offer_sdp,
+        }));
+
+        const answer = await answerPromise;
+        return jsonResponse({
+          answer_sdp: answer.answer_sdp,
+          error: answer.error,
+        });
+      } catch (e) {
+        return new Response(
+          JSON.stringify({ error: e.message }),
+          { status: 500, headers: corsHeaders({ "Content-Type": "application/json" }) }
+        );
+      }
+    }
+
+    return new Response("Not found in DO", { status: 404 });
+  }
+}
 
 export default {
   async fetch(request, env) {
@@ -36,15 +196,39 @@ export default {
       return new Response("ok", { status: 200 });
     }
 
+    // Helper: get DO stub for session if binding is present
+    const getDOStub = (sessionID) => {
+      if (env.SIGNALING_DO && sessionID) {
+        const id = env.SIGNALING_DO.idFromName(sessionID);
+        return env.SIGNALING_DO.get(id);
+      }
+      return null;
+    };
+
     // 1. Hosted-AI Redirect Handling: /ai/:session/* -> 307 Redirect to host direct IP/port
     if (url.pathname.startsWith("/ai/")) {
       const parts = url.pathname.split("/").filter(Boolean);
       if (parts.length >= 2) {
         const sessionID = parts[1];
-        const sess = sessions.get(sessionID);
-        if (sess && sess.direct_url) {
+        let directURL = null;
+
+        const stub = getDOStub(sessionID);
+        if (stub) {
+          try {
+            const resp = await stub.fetch(new Request("https://do/direct_url"));
+            if (resp.ok) {
+              const data = await resp.json();
+              directURL = data.direct_url;
+            }
+          } catch (_) {}
+        } else {
+          const sess = fallbackSessions.get(sessionID);
+          if (sess) directURL = sess.direct_url;
+        }
+
+        if (directURL) {
           const subPath = parts.slice(2).join("/");
-          const target = new URL(subPath + url.search, sess.direct_url);
+          const target = new URL(subPath + url.search, directURL);
           return Response.redirect(target.toString(), 307);
         }
         return new Response("Hosted-AI direct endpoint not registered or expired for session: " + sessionID, { status: 404 });
@@ -55,9 +239,16 @@ export default {
     if (request.method === "POST" && url.pathname.endsWith("/register")) {
       const parts = url.pathname.split("/").filter(Boolean);
       const sessionID = parts[1];
+
+      const stub = getDOStub(sessionID);
+      if (stub) {
+        return stub.fetch(request);
+      }
+
+      // Fallback in-memory registration
       try {
         const data = await request.json();
-        sessions.set(sessionID, {
+        fallbackSessions.set(sessionID, {
           session_id: sessionID,
           name: data.name || sessionID,
           secret_hash: data.secret_hash,
@@ -75,12 +266,19 @@ export default {
     if (request.method === "GET" && url.pathname.startsWith("/api/share/")) {
       const parts = url.pathname.split("/").filter(Boolean);
       const sessionID = parts[2];
-      const sess = sessions.get(sessionID);
+
+      const stub = getDOStub(sessionID);
+      if (stub) {
+        return stub.fetch(request);
+      }
+
+      const sess = fallbackSessions.get(sessionID);
       if (sess) {
         return jsonResponse({
           session_id: sess.session_id,
           name: sess.name,
           expires_at: sess.expires_at,
+          has_host: fallbackHostSockets.has(sessionID),
         });
       }
       return jsonResponse({ session_id: sessionID, name: sessionID });
@@ -91,8 +289,14 @@ export default {
       const parts = url.pathname.split("/").filter(Boolean);
       const sessionID = parts[1];
 
+      const stub = getDOStub(sessionID);
+      if (stub) {
+        return stub.fetch(request);
+      }
+
+      // Fallback in-memory host socket
       const upgradeHeader = request.headers.get("Upgrade");
-      if (!upgradeHeader || upgradeHeader !== "websocket") {
+      if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
         return new Response("Expected WebSocket upgrade", { status: 426 });
       }
 
@@ -100,15 +304,15 @@ export default {
       const [client, server] = Object.values(webSocketPair);
 
       server.accept();
-      hostConnections.set(sessionID, server);
+      fallbackHostSockets.set(sessionID, server);
 
       server.addEventListener("message", (event) => {
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === "answer" && msg.request_id) {
-            const resolver = pendingSignalRequests.get(msg.request_id);
+            const resolver = fallbackPendingSignals.get(msg.request_id);
             if (resolver) {
-              pendingSignalRequests.delete(msg.request_id);
+              fallbackPendingSignals.delete(msg.request_id);
               resolver(msg);
             }
           }
@@ -116,8 +320,8 @@ export default {
       });
 
       server.addEventListener("close", () => {
-        if (hostConnections.get(sessionID) === server) {
-          hostConnections.delete(sessionID);
+        if (fallbackHostSockets.get(sessionID) === server) {
+          fallbackHostSockets.delete(sessionID);
         }
       });
 
@@ -132,11 +336,20 @@ export default {
       const parts = url.pathname.split("/").filter(Boolean);
       const sessionID = parts[1];
 
+      const stub = getDOStub(sessionID);
+      if (stub) {
+        return stub.fetch(request);
+      }
+
+      // Fallback in-memory signaling
       if (request.method === "POST") {
-        const hostSocket = hostConnections.get(sessionID);
+        const hostSocket = fallbackHostSockets.get(sessionID);
         if (!hostSocket) {
           return new Response(
-            JSON.stringify({ error: "Host peer is currently offline or unreachable" }),
+            JSON.stringify({
+              error: "Host peer is currently offline or unreachable",
+              code: "HOST_OFFLINE"
+            }),
             { status: 503, headers: corsHeaders({ "Content-Type": "application/json" }) }
           );
         }
@@ -147,11 +360,11 @@ export default {
 
           const answerPromise = new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
-              pendingSignalRequests.delete(reqID);
+              fallbackPendingSignals.delete(reqID);
               reject(new Error("Timeout waiting for host SDP answer"));
             }, 8000);
 
-            pendingSignalRequests.set(reqID, (answerMsg) => {
+            fallbackPendingSignals.set(reqID, (answerMsg) => {
               clearTimeout(timer);
               resolve(answerMsg);
             });
@@ -177,25 +390,18 @@ export default {
       }
     }
 
-    // 6. Static WebUI delivery: /s/:session or /
-    if (url.pathname === "/" || url.pathname.startsWith("/s/")) {
-      // In production Cloudflare Workers with Static Assets, env.ASSETS.fetch serves files.
-      // Otherwise fallback to static index.
-      if (env.ASSETS) {
-        return env.ASSETS.fetch(request);
+    // 6. Static WebUI Asset Delivery:
+    // If env.ASSETS is configured (Cloudflare Static Assets), fetch directly through it.
+    if (env.ASSETS) {
+      if (url.pathname.startsWith("/s/")) {
+        // Rewrite /s/:session to /index.html for SPA routing
+        const spaRequest = new Request(new URL("/index.html", request.url), request);
+        return env.ASSETS.fetch(spaRequest);
       }
-      return new Response(INDEX_HTML, {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
-    }
-
-    if (url.pathname === "/app.js" && env.ASSETS) {
-      return env.ASSETS.fetch(request);
-    }
-    if (url.pathname === "/style.css" && env.ASSETS) {
       return env.ASSETS.fetch(request);
     }
 
+    // Fallback: Return basic SPA redirect or not found
     return new Response("Not found", { status: 404 });
   },
 };
@@ -215,27 +421,3 @@ function corsHeaders(extra = {}) {
     ...extra,
   };
 }
-
-const INDEX_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Aestrl — P2P File Inspector</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 2rem; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 80vh; }
-    h1 { font-size: 2.5rem; margin-bottom: 0.5rem; }
-    p { color: #94a3b8; font-size: 1.1rem; }
-    .card { background: #1e293b; border-radius: 8px; padding: 2rem; border: 1px solid #334155; max-width: 600px; width: 100%; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.5); }
-    code { background: #0f172a; padding: 0.2rem 0.4rem; border-radius: 4px; font-family: monospace; color: #38bdf8; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>✦ aestrl</h1>
-    <p>Portable, read-only, peer-to-peer file inspection tool.</p>
-    <p>To inspect a share in browser or CLI:</p>
-    <p><code>aestrl tui &lt;share_url&gt;</code> or open the share link with capability fragment.</p>
-  </div>
-</body>
-</html>`;

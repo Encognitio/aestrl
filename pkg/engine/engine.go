@@ -716,6 +716,56 @@ func (e *Engine) GetRawFile(relPath string, offset, length int64) (*RawFileResul
 	}, nil
 }
 
+// StreamRawFile opens a file for chunked streaming, seeking to offset and returning an io.ReadCloser,
+// total file size, mime type, and error. Bounded memory: caller reads in small buffers.
+func (e *Engine) StreamRawFile(relPath string, offset, length int64) (io.ReadCloser, int64, string, error) {
+	realPath, _, err := e.resolvePath(relPath)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	info, err := os.Stat(realPath)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	if info.IsDir() {
+		return nil, 0, "", ErrIsDirectory
+	}
+
+	f, err := os.Open(realPath)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	size := info.Size()
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > size {
+		offset = size
+	}
+
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		_ = f.Close()
+		return nil, 0, "", err
+	}
+
+	mimeType := detectMime(info.Name(), realPath)
+
+	var rc io.ReadCloser = f
+	if length >= 0 && offset+length < size {
+		rc = struct {
+			io.Reader
+			io.Closer
+		}{
+			Reader: io.LimitReader(f, length),
+			Closer: f,
+		}
+	}
+
+	return rc, size, mimeType, nil
+}
+
 // Compare produces a line-by-line diff between two text files.
 func (e *Engine) Compare(path1, path2 string) (*CompareResult, error) {
 	res1, err := e.ReadFile(path1, 1, 0)

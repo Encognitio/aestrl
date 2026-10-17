@@ -50,6 +50,8 @@ type DCResponse struct {
 	Result   interface{} `json:"result,omitempty"`
 	Error    string      `json:"error,omitempty"`
 	Chunk    string      `json:"chunk,omitempty"`
+	Offset   int64       `json:"offset,omitempty"`
+	Length   int64       `json:"length,omitempty"`
 	IsLast   bool        `json:"is_last,omitempty"`
 	MimeType string      `json:"mime_type,omitempty"`
 	Total    int64       `json:"total,omitempty"`
@@ -189,15 +191,40 @@ func (sh *SessionHandler) dispatchAction(dc *webrtc.DataChannel, req *DCRequest)
 		req.Args = make(map[string]interface{})
 	}
 
-	// Legacy browser streaming download support
-	if req.Action == "get_file" {
+	// Streaming raw file retrieval (supports get_file and raw streaming with offset/length/resume)
+	if req.Action == "get_file" || (req.Action == "raw" && req.Args["stream"] == true) {
 		path, _ := req.Args["path"].(string)
-		rawRes, err := sh.engine.GetRawFile(path, 0, -1)
+		var offset int64 = 0
+		var length int64 = -1
+		if offVal, ok := req.Args["offset"]; ok {
+			switch v := offVal.(type) {
+			case float64:
+				offset = int64(v)
+			case int64:
+				offset = v
+			case int:
+				offset = int64(v)
+			}
+		}
+		if lenVal, ok := req.Args["length"]; ok {
+			switch v := lenVal.(type) {
+			case float64:
+				length = int64(v)
+			case int64:
+				length = v
+			case int:
+				length = int64(v)
+			}
+		}
+
+		reader, totalSize, mimeType, err := sh.engine.StreamRawFile(path, offset, length)
 		if err != nil {
 			sh.sendDCError(dc, req.ID, req.Action, err.Error())
 			return
 		}
-		sh.streamFileChunks(dc, req.ID, req.Action, bytes.NewReader(rawRes.Data), rawRes.Size, rawRes.MimeType)
+		defer reader.Close()
+
+		sh.streamFileChunks(dc, req.ID, req.Action, reader, offset, totalSize, mimeType)
 		return
 	}
 
@@ -210,22 +237,26 @@ func (sh *SessionHandler) dispatchAction(dc *webrtc.DataChannel, req *DCRequest)
 	sh.sendDCSuccess(dc, req.ID, req.Action, res)
 }
 
-func (sh *SessionHandler) streamFileChunks(dc *webrtc.DataChannel, reqID, action string, r io.Reader, totalSize int64, mimeType string) {
+func (sh *SessionHandler) streamFileChunks(dc *webrtc.DataChannel, reqID, action string, r io.Reader, startOffset, totalSize int64, mimeType string) {
 	buf := make([]byte, 32*1024) // 32KB chunks
+	currOffset := startOffset
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
-			isLast := (err == io.EOF)
+			isLast := (err == io.EOF) || (totalSize >= 0 && currOffset+int64(n) >= totalSize)
 			resp := DCResponse{
 				ID:       reqID,
 				Action:   action,
 				Chunk:    hex.EncodeToString(buf[:n]),
+				Offset:   currOffset,
+				Length:   int64(n),
 				IsLast:   isLast,
 				MimeType: mimeType,
 				Total:    totalSize,
 			}
 			data, _ := json.Marshal(resp)
 
+			// Flow control / backpressure
 			for dc.BufferedAmount() > 512*1024 {
 				time.Sleep(10 * time.Millisecond)
 			}
@@ -233,9 +264,27 @@ func (sh *SessionHandler) streamFileChunks(dc *webrtc.DataChannel, reqID, action
 			if err := dc.SendText(string(data)); err != nil {
 				return
 			}
+			currOffset += int64(n)
+			if isLast {
+				break
+			}
 		}
 
 		if err == io.EOF {
+			if currOffset == startOffset {
+				resp := DCResponse{
+					ID:       reqID,
+					Action:   action,
+					Chunk:    "",
+					Offset:   currOffset,
+					Length:   0,
+					IsLast:   true,
+					MimeType: mimeType,
+					Total:    totalSize,
+				}
+				data, _ := json.Marshal(resp)
+				_ = dc.SendText(string(data))
+			}
 			break
 		}
 		if err != nil {
@@ -394,7 +443,7 @@ func DialWithSignaling(ctx context.Context, sessionID, secret, signalEndpoint st
 
 		client.mu.Lock()
 		ch, ok := client.pending[resp.ID]
-		if ok {
+		if ok && (resp.IsLast || resp.Chunk == "" || resp.Error != "") {
 			delete(client.pending, resp.ID)
 		}
 		client.mu.Unlock()
@@ -556,6 +605,85 @@ func (cs *ClientSession) Execute(ctx context.Context, action string, args map[st
 		return nil, ctx.Err()
 	case <-cs.closeChan:
 		return nil, ErrSessionClosed
+	}
+}
+
+// StreamRaw streams a file with bounded memory, supporting offset resuming, progress reporting, and cancellation.
+func (cs *ClientSession) StreamRaw(ctx context.Context, path string, offset int64, w io.Writer, progressFn func(received, total int64)) error {
+	reqID := fmt.Sprintf("req-%d", atomic.AddUint64(&cs.reqCounter, 1))
+	respChan := make(chan *DCResponse, 64)
+
+	cs.mu.Lock()
+	select {
+	case <-cs.closeChan:
+		cs.mu.Unlock()
+		return ErrSessionClosed
+	default:
+		cs.pending[reqID] = respChan
+	}
+	cs.mu.Unlock()
+
+	defer func() {
+		cs.mu.Lock()
+		delete(cs.pending, reqID)
+		cs.mu.Unlock()
+	}()
+
+	req := DCRequest{
+		ID:     reqID,
+		Action: "raw",
+		Secret: cs.Secret,
+		Args: map[string]interface{}{
+			"path":   path,
+			"stream": true,
+			"offset": offset,
+		},
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	if err := cs.dc.SendText(string(data)); err != nil {
+		return fmt.Errorf("failed to send DC message: %w", err)
+	}
+
+	var bytesReceived int64 = 0
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-cs.closeChan:
+			return ErrSessionClosed
+		case resp, ok := <-respChan:
+			if !ok {
+				return errors.New("stream channel closed unexpectedly")
+			}
+			if resp.Error != "" {
+				return errors.New(resp.Error)
+			}
+			if resp.Chunk != "" {
+				chunkBytes, err := hex.DecodeString(resp.Chunk)
+				if err != nil {
+					return fmt.Errorf("chunk decode error: %w", err)
+				}
+				if len(chunkBytes) > 0 {
+					if _, err := w.Write(chunkBytes); err != nil {
+						return fmt.Errorf("write error: %w", err)
+					}
+					bytesReceived += int64(len(chunkBytes))
+					if progressFn != nil {
+						progressFn(offset+bytesReceived, resp.Total)
+					}
+				}
+			}
+			if resp.IsLast {
+				return nil
+			}
+		case <-time.After(30 * time.Second):
+			return errors.New("stream transfer timed out waiting for chunks")
+		}
 	}
 }
 

@@ -555,6 +555,213 @@ body {
   white-space: pre-wrap;
 }
 
+.btn-outline {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+}
+.btn-outline:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--text-muted);
+}
+.btn-xs {
+  padding: 2px 8px;
+  font-size: 0.72rem;
+  border-radius: 4px;
+}
+.btn-text {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px;
+}
+.btn-text:hover {
+  color: var(--text-main);
+}
+
+/* Banner actions */
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  font-size: 0.85rem;
+  z-index: 90;
+}
+.banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Transfer Activity Bar */
+.transfer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--accent);
+  padding: 8px 16px;
+  font-size: 0.82rem;
+  z-index: 85;
+}
+.transfer-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  color: var(--accent);
+  white-space: nowrap;
+}
+.transfer-spin {
+  display: inline-block;
+  animation: pulse 1s infinite alternate;
+}
+@keyframes pulse {
+  from { opacity: 0.4; }
+  to { opacity: 1.0; }
+}
+.transfer-progress-track {
+  flex: 1;
+  height: 6px;
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.transfer-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.15s ease-out;
+}
+
+/* Status variants */
+.status-indicator.status-discovering {
+  background: #a855f7;
+  box-shadow: 0 0 6px #a855f7;
+}
+.status-indicator.status-transferring {
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+  animation: pulse 0.8s infinite alternate;
+}
+
+/* PDF Preview */
+.pdf-preview {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+.pdf-preview iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: #525659;
+}
+
+/* Modal Backdrop & Card */
+.modal-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.modal-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  width: 90%;
+  max-width: 480px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-color);
+}
+.modal-header h3 {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+.modal-body {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.modal-desc {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+.qr-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+}
+.qr-canvas svg, .qr-canvas canvas {
+  display: block;
+  border-radius: 4px;
+}
+.qr-hint {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+.share-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.share-field label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.input-with-button {
+  display: flex;
+  gap: 8px;
+}
+.input-with-button input {
+  flex: 1;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: var(--text-main);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  outline: none;
+}
+.input-with-button input:focus {
+  border-color: var(--accent);
+}
+.share-footer-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
 /* Responsive */
 @media (max-width: 768px) {
   :root {

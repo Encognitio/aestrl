@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/Encognitio/aestrl/pkg/host"
 	"github.com/Encognitio/aestrl/pkg/p2p"
 	"github.com/Encognitio/aestrl/pkg/tui"
+	"github.com/skip2/go-qrcode"
 	"golang.org/x/sys/unix"
 )
 
@@ -246,6 +248,7 @@ func runShare(args []string) {
 	aiDomain := fs.String("domain", "", "Public domain for Let's Encrypt HTTPS on Hosted-AI adapter")
 	allowHTTP := fs.Bool("allow-http", false, "Explicitly approve unencrypted HTTP fallback if HTTPS fails")
 	foreground := fs.Bool("foreground", false, "Run in foreground")
+	noQR := fs.Bool("no-qr", false, "Do not print terminal QR code")
 	hubURL := fs.String("hub", config.DefaultHubURL, "Cloudflare coordination URL")
 	_ = fs.Parse(args)
 
@@ -284,6 +287,8 @@ func runShare(args []string) {
 		HubURL:     *hubURL,
 	}
 
+	showQR := !*noQR
+
 	if *foreground {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -295,7 +300,7 @@ func runShare(args []string) {
 		}
 		defer share.Close()
 
-		printShareDetails(&share.Info, true)
+		printShareDetails(&share.Info, true, showQR)
 
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -317,20 +322,34 @@ func runShare(args []string) {
 		os.Exit(1)
 	}
 
-	printShareDetails(info, false)
+	printShareDetails(info, false, showQR)
 }
 
-func printShareDetails(info *host.ShareInfo, isForeground bool) {
-	fmt.Printf("\nAestrl sharing: %s\n\n", info.RootDir)
-	fmt.Printf("Share URL:\n%s\n\n", info.ShareURL)
+func printShareDetails(info *host.ShareInfo, isForeground bool, showQR bool) {
+	fmt.Printf("\n✦ Aestrl Share Active: %s\n\n", info.RootDir)
+	fmt.Println("ACCESS LINKS:")
+	fmt.Printf("  Browser URL:   %s\n", info.ShareURL)
+	fmt.Printf("  CLI / TUI:     aestrl tui %s\n", info.ShareURL)
 
 	if info.AIURL != "" {
-		fmt.Printf("Hosted-AI URL:\n%s/?secret=%s\n\n", info.AIURL, info.Secret)
+		fmt.Printf("  Hosted-AI:     %s/?secret=%s\n", info.AIURL, info.Secret)
 	}
 
-	fmt.Printf("Session ID: %s\n", info.SessionID)
-	fmt.Printf("Expires:    %s (%s remaining)\n\n", info.ExpiresAt.Format(time.RFC1123), time.Until(info.ExpiresAt).Round(time.Second))
+	fmt.Printf("\nDETAILS:\n")
+	fmt.Printf("  Session ID:    %s\n", info.SessionID)
+	fmt.Printf("  Expires:       %s (%s remaining)\n", info.ExpiresAt.Format(time.RFC1123), time.Until(info.ExpiresAt).Round(time.Second))
+	if info.PeerCount > 0 {
+		fmt.Printf("  Connected:     %d active peer(s)\n", info.PeerCount)
+	}
 
+	if showQR {
+		if qr, err := qrcode.New(info.ShareURL, qrcode.Medium); err == nil {
+			fmt.Printf("\nSCAN TO ACCESS (Mobile Camera):\n\n")
+			fmt.Print(qr.ToSmallString(false))
+		}
+	}
+
+	fmt.Println()
 	if isForeground {
 		fmt.Println("Press Ctrl+C to stop sharing.")
 	} else {
@@ -434,10 +453,19 @@ func runTUI(args []string) {
 
 func runOp(op string, args []string) {
 	jsonOutput := false
+	var outputFile string
+	var resume bool
 	var filteredArgs []string
-	for _, a := range args {
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		if a == "--json" {
 			jsonOutput = true
+		} else if (a == "--output" || a == "-o") && i+1 < len(args) {
+			outputFile = args[i+1]
+			i++
+		} else if a == "--resume" {
+			resume = true
 		} else {
 			filteredArgs = append(filteredArgs, a)
 		}
@@ -460,7 +488,7 @@ func runOp(op string, args []string) {
 
 	if shareTarget != "" {
 		// Remote encrypted WebRTC P2P execution
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
 		client, err := p2p.DialShare(ctx, shareTarget)
@@ -469,6 +497,54 @@ func runOp(op string, args []string) {
 			os.Exit(1)
 		}
 		defer client.Close()
+
+		// Specialized streaming path for raw retrieval
+		if op == "raw" && !jsonOutput {
+			targetPath, _ := params["path"].(string)
+			var w io.Writer = os.Stdout
+			var offset int64 = 0
+
+			if outputFile != "" {
+				flags := os.O_CREATE | os.O_WRONLY
+				if resume {
+					if fi, err := os.Stat(outputFile); err == nil {
+						offset = fi.Size()
+						flags |= os.O_APPEND
+						fmt.Fprintf(os.Stderr, "Resuming download from byte %d...\n", offset)
+					} else {
+						flags |= os.O_TRUNC
+					}
+				} else {
+					flags |= os.O_TRUNC
+				}
+
+				f, err := os.OpenFile(outputFile, flags, 0644)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error opening output file: %v\n", err)
+					os.Exit(1)
+				}
+				defer f.Close()
+				w = f
+			}
+
+			err = client.StreamRaw(ctx, targetPath, offset, w, func(received, total int64) {
+				if outputFile != "" {
+					pct := 0
+					if total > 0 {
+						pct = int((received * 100) / total)
+					}
+					fmt.Fprintf(os.Stderr, "\r  [%s] %3d%% (%s / %s)", formatProgressBar(pct), pct, formatBytes(received), formatBytes(total))
+				}
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "\nStream transfer failed: %v\n", err)
+				os.Exit(1)
+			}
+			if outputFile != "" {
+				fmt.Fprintf(os.Stderr, "\nDownload complete: saved to %s\n", outputFile)
+			}
+			return
+		}
 
 		res, err := client.Execute(ctx, op, params)
 		if err != nil {
@@ -487,6 +563,58 @@ func runOp(op string, args []string) {
 		os.Exit(1)
 	}
 
+	// Specialized streaming path for local raw retrieval
+	if op == "raw" && !jsonOutput && outputFile != "" {
+		targetPath, _ := params["path"].(string)
+		var offset int64 = 0
+		flags := os.O_CREATE | os.O_WRONLY
+		if resume {
+			if fi, err := os.Stat(outputFile); err == nil {
+				offset = fi.Size()
+				flags |= os.O_APPEND
+				fmt.Fprintf(os.Stderr, "Resuming file from byte %d...\n", offset)
+			} else {
+				flags |= os.O_TRUNC
+			}
+		} else {
+			flags |= os.O_TRUNC
+		}
+
+		f, err := os.OpenFile(outputFile, flags, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening output file: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+
+		reader, total, _, err := eng.StreamRawFile(targetPath, offset, -1)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Stream error: %v\n", err)
+			os.Exit(1)
+		}
+		defer reader.Close()
+
+		buf := make([]byte, 32*1024)
+		var received = offset
+		for {
+			n, rErr := reader.Read(buf)
+			if n > 0 {
+				_, _ = f.Write(buf[:n])
+				received += int64(n)
+				pct := 0
+				if total > 0 {
+					pct = int((received * 100) / total)
+				}
+				fmt.Fprintf(os.Stderr, "\r  [%s] %3d%% (%s / %s)", formatProgressBar(pct), pct, formatBytes(received), formatBytes(total))
+			}
+			if rErr != nil {
+				break
+			}
+		}
+		fmt.Fprintf(os.Stderr, "\nComplete: saved to %s\n", outputFile)
+		return
+	}
+
 	res, err := eng.Execute(op, params)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Operation %s failed: %v\n", op, err)
@@ -494,6 +622,34 @@ func runOp(op string, args []string) {
 	}
 
 	printOpResult(op, res, jsonOutput)
+}
+
+func formatProgressBar(pct int) string {
+	const width = 25
+	filled := (pct * width) / 100
+	if filled > width {
+		filled = width
+	}
+	if filled < 0 {
+		filled = 0
+	}
+	return strings.Repeat("=", filled) + strings.Repeat(" ", width-filled)
+}
+
+func formatBytes(b int64) string {
+	if b <= 0 {
+		return "0 B"
+	}
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 func buildOpParams(op string, args []string) map[string]interface{} {

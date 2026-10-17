@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -58,7 +59,7 @@ func TestP2PEndToEnd(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
 	client, err := DialWithSignaling(ctx, sessionID, secret, server.URL+"/s/"+sessionID+"/signal")
@@ -99,4 +100,32 @@ func TestP2PEndToEnd(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error with wrong secret, got nil")
 	}
+
+	// 4. Test StreamRaw and offset resumption
+	var buf bytes.Buffer
+	var receivedProg, totalProg int64
+	err = client.StreamRaw(ctx, "hello.txt", 0, &buf, func(rec, tot int64) {
+		receivedProg = rec
+		totalProg = tot
+	})
+	if err != nil {
+		t.Fatalf("StreamRaw failed: %v", err)
+	}
+	if buf.String() != "Hello, Aestrl P2P! Line two." {
+		t.Fatalf("StreamRaw content mismatch, got %q", buf.String())
+	}
+	if receivedProg != int64(len("Hello, Aestrl P2P! Line two.")) || totalProg != receivedProg {
+		t.Fatalf("unexpected progress: received=%d, total=%d", receivedProg, totalProg)
+	}
+
+	// Test resuming with offset: skip first 7 bytes ("Hello, ")
+	var resumeBuf bytes.Buffer
+	err = client.StreamRaw(ctx, "hello.txt", 7, &resumeBuf, nil)
+	if err != nil {
+		t.Fatalf("StreamRaw with offset failed: %v", err)
+	}
+	if resumeBuf.String() != "Aestrl P2P! Line two." {
+		t.Fatalf("StreamRaw resumed content mismatch, got %q", resumeBuf.String())
+	}
 }
+
